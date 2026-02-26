@@ -14,7 +14,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
-    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -27,7 +26,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    restart: unless-stopped
 
   api:
     build:
@@ -41,9 +39,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Alpine-friendly (wget exists)
+    # IMPORTANT: don't assume wget/curl exists in the API image.
+    # Use python (it WILL exist) to check the health endpoint.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health >/dev/null 2>&1 || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read(); print('ok')\""
+        ]
       interval: 10s
       timeout: 5s
       retries: 20
