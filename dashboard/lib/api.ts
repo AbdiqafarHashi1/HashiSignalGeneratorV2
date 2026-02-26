@@ -1,12 +1,32 @@
-import axios from 'axios';
+import axios from "axios";
+
+const baseURL =
+  (process.env.NEXT_PUBLIC_API_BASE_URL as string | undefined) ??
+  "http://localhost:8000";
 
 const client = axios.create({
-  baseURL: process.env.NEXT_PUBLIC_API_BASE_URL || 'http://api:8000',
-  timeout: 2000,
+  baseURL,
+  timeout: 5000,
 });
 
-export const fetchOverview = async () => (await client.get('/overview')).data;
-export const fetchTrades = async (limit = 50, offset = 0) =>
-  (await client.get('/trades', { params: { limit, offset } })).data;
-export const fetchPositions = async () => (await client.get('/positions')).data;
-export const fetchEngineStatus = async () => (await client.get('/engine/status')).data;
+export const fetchOverview = async () => {
+  const { data } = await client.get("/overview");
+  return data;
+};
+
+export const fetchTrades = async (limit = 50, offset = 0) => {
+  const { data } = await client.get("/trades", {
+    params: { limit, offset },
+  });
+  return data;
+};
+
+export const fetchPositions = async () => {
+  const { data } = await client.get("/positions");
+  return data;
+};
+
+export const fetchEngineStatus = async () => {
+  const { data } = await client.get("/engine/status");
+  return data;
+};

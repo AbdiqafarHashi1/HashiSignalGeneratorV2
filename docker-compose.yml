@@ -6,26 +6,28 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: hashisignal
     ports:
-      - '5432:5432'
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres -d hashisignal']
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hashisignal"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 20
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     ports:
-      - '6379:6379'
+      - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 20
+    restart: unless-stopped
 
   api:
     build:
@@ -33,28 +35,31 @@ services:
     env_file:
       - .env
     ports:
-      - '8000:8000'
+      - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Alpine-friendly (wget exists)
     healthcheck:
-      test: ['CMD', 'curl', '-f', 'http://localhost:8000/health']
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 6
+      retries: 20
+    restart: unless-stopped
 
   dashboard:
     build:
       context: ./dashboard
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://api:8000
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
     ports:
-      - '3000:3000'
+      - "3000:3000"
     depends_on:
       api:
         condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:
