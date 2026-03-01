@@ -227,3 +227,22 @@ It runs:
 4) vol-sizing-only
 5) all-enabled
 and prints trade-count/PnL/fees/win-rate/trade-hash fingerprints.
+
+## How to debug no trades
+1. **UI path**: open dashboard → **Truth Inspector / Signal / Reasoning** panel.
+   - Check `Final Action`, `Entry Eligibility`, `Router Strategy`, `Trade Blocker (primary)`, and `Trade Blockers`.
+   - These fields explain "PASS but no trade" with one primary blocker and full blocker list.
+2. **API path**: query replay observability payload:
+```bash
+curl -s "http://localhost:8000/replay/observability?n=200" | jq
+```
+Response includes:
+   - `decision_traces` (last N bars)
+   - `blocker_counters` aggregate summary
+   - `no_trade_streak` longest no-entry diagnostic
+   - `replay` status (clock/running)
+3. **Smoke script** (local or docker):
+```bash
+python backend/scripts/smoke_replay_observability.py
+```
+This runs a deterministic replay window (target 30 days for `ETHUSDT_15m`) and prints summary/top blockers/trade count/longest no-entry streak.
