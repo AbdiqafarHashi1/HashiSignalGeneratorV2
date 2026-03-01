@@ -419,6 +419,7 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
             'router_selected_strategy': snapshot.get('router_selected_strategy') if isinstance(snapshot, dict) else None,
             'trade_blocker_primary': snapshot.get('trade_blocker_primary') if isinstance(snapshot, dict) else None,
             'trade_blockers': snapshot.get('trade_blockers') if isinstance(snapshot, dict) else None,
+            'router_reason': snapshot.get('router_reason') if isinstance(snapshot, dict) else None,
         }
 
     obs_latest = engine.observability_snapshot(last_n=1).get('decision_traces', [])
@@ -429,6 +430,7 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
         latest_decision['router_selected_strategy'] = latest_trace.get('router', {}).get('selected')
         latest_decision['trade_blocker_primary'] = latest_trace.get('trade_blocker_primary')
         latest_decision['trade_blockers'] = latest_trace.get('trade_blockers')
+        latest_decision['router_reason'] = latest_trace.get('router', {}).get('reason')
 
     gov_now = None
     if replay_payload.get('candle_ts'):
