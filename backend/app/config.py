@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     gov_emergency_unrealized_pct: float = 100.0
     gov_max_position_hold_secs: int = 999999
     incident_ring_size: int = 500
+    decision_trace_ring_size: int = 1000
     incident_snapshot_on_kill: bool = True
     trading_day_tz: str = 'UTC'
 

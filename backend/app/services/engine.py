@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter, deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -70,6 +71,19 @@ class EngineService:
             'daily_fees': 0.0,
             'daily_trade_count': 0,
         }
+        self._decision_traces = deque(maxlen=max(10, int(settings.decision_trace_ring_size)))
+        self._trace_summary: dict[str, object] = {
+            'total_bars': 0,
+            'regime_pass': 0,
+            'regime_fail': 0,
+            'setup_confirmed_true': 0,
+            'setup_confirmed_false': 0,
+            'router_selected': Counter(),
+            'blockers': Counter(),
+            'governor_blockers': Counter(),
+            'score_ge_min_no_trade': Counter(),
+            'entry_bars': [],
+        }
 
     async def start(self, mode: str = 'live') -> dict:
         if self.running:
@@ -136,6 +150,19 @@ class EngineService:
         )
         self.replay_dataset_id = dataset_id
         self._history_by_symbol.clear()
+        self._decision_traces.clear()
+        self._trace_summary = {
+            'total_bars': 0,
+            'regime_pass': 0,
+            'regime_fail': 0,
+            'setup_confirmed_true': 0,
+            'setup_confirmed_false': 0,
+            'router_selected': Counter(),
+            'blockers': Counter(),
+            'governor_blockers': Counter(),
+            'score_ge_min_no_trade': Counter(),
+            'entry_bars': [],
+        }
         await self.replay.start()
         return await self.start(mode='replay')
 
@@ -146,6 +173,7 @@ class EngineService:
         self._open_bar_by_symbol.clear()
         self._tp1_done_by_trade.clear()
         self._history_by_symbol.clear()
+        self._decision_traces.clear()
         return await self.stop()
 
     async def pause_replay(self) -> dict:
@@ -314,9 +342,10 @@ class EngineService:
             decision = plan.decision
             rationale = ', '.join(plan.reasons) if plan.reasons else 'strategy_evaluated'
 
+            final_action = 'HOLD'
             if position and trade:
                 position.unrealized_pnl = self._calc_unrealized(position=position, mark_price=price_close)
-                await self._evaluate_open_trade(
+                final_action = await self._evaluate_open_trade(
                     db=db,
                     trade=trade,
                     position=position,
@@ -398,9 +427,11 @@ class EngineService:
                         side=plan.side,
                         plan=plan,
                     )
+                    final_action = 'ENTER'
                 else:
                     decision = 'BLOCKED'
                     blockers = gov['blockers']
+                    final_action = 'HOLD'
                     await self._emit_blocked_event(
                         db=db,
                         ts_ms=ts_ms,
@@ -412,6 +443,25 @@ class EngineService:
                     )
             else:
                 decision = 'hold'
+                if plan.decision in ('enter_long', 'enter_short'):
+                    final_action = 'SIGNAL_LONG' if plan.decision == 'enter_long' else 'SIGNAL_SHORT'
+
+            blocker_list = self._build_blockers(plan=plan, blockers=blockers, position_open=bool(position and trade), decision=decision)
+            primary_blocker = blocker_list[0] if blocker_list else None
+            if final_action == 'HOLD' and plan.decision == 'hold' and 'router_stand_down' in (plan.reasons or []):
+                final_action = 'STAND_DOWN'
+            trace = self._build_decision_trace(
+                tick=tick,
+                symbol=symbol,
+                replay_clock=replay_clock,
+                plan=plan,
+                final_action=final_action,
+                decision=decision,
+                blockers=blocker_list,
+                primary_blocker=primary_blocker,
+                position_open=bool(position and trade),
+            )
+            self._record_decision_trace(trace)
 
             await self._record_decision_event(
                 db=db,
@@ -564,7 +614,7 @@ class EngineService:
         ts_dt: datetime,
         replay_clock: int,
         plan: TradePlan,
-    ) -> None:
+    ) -> str:
         stop = Decimal(str(trade.stop_price or 0))
         tp1 = Decimal(str(trade.tp1_price or 0))
         tp2 = Decimal(str(trade.tp2_price or 0))
@@ -596,7 +646,7 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
-            return
+            return 'EXIT'
 
         if tp2_hit:
             if not tp1_done and tp1 > 0:
@@ -622,7 +672,7 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
-            return
+            return 'EXIT'
 
         if tp1_hit and not tp1_done:
             await self._partial_close(
@@ -635,6 +685,7 @@ class EngineService:
                 portion=settings.partial_pct,
             )
             self._tp1_done_by_trade[trade.id] = True
+            return 'PARTIAL'
 
         if bars_held >= time_stop_limit:
             await self._final_close(
@@ -648,7 +699,7 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
-            return
+            return 'EXIT'
 
         opposite = (trade.side == 'BUY' and plan.side == 'SELL') or (trade.side == 'SELL' and plan.side == 'BUY')
         if opposite and plan.score_total >= settings.score_min:
@@ -663,6 +714,225 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
+            return 'EXIT'
+        return 'HOLD'
+
+    def _build_blockers(self, *, plan: TradePlan, blockers: list[dict], position_open: bool, decision: str) -> list[str]:
+        blocker_set = set(str(b.get('name')) for b in blockers if isinstance(b, dict) and b.get('name'))
+        blocker_set.update(str(b) for b in (plan.blockers or []) if b)
+        if position_open:
+            blocker_set.add('already_in_position')
+        if decision == 'BLOCKED' and any(str(b.get('name')) == 'kill_switch' for b in blockers if isinstance(b, dict)):
+            blocker_set.add('kill_switch')
+        if plan.decision == 'hold' and plan.side is None and 'setup_not_confirmed' in (plan.reasons or []):
+            blocker_set.add('waiting_confirm')
+        if any(str(r).startswith('breakout_no_') for r in (plan.reasons or [])):
+            blocker_set.add('router_hold')
+        if decision == 'BLOCKED' and blockers:
+            blocker_set.add('governor_block')
+        if plan.qty <= 0:
+            blocker_set.add('qty_invalid')
+        if not blocker_set and plan.decision == 'hold':
+            blocker_set.add('router_hold')
+        return sorted(blocker_set)
+
+    def _router_status(self, plan: TradePlan) -> tuple[str, str]:
+        selected = 'none'
+        if plan.active_mode == 'STAND_DOWN':
+            return 'stand_down', selected
+        if plan.decision in ('enter_long', 'enter_short'):
+            selected = 'breakout' if 'breakout' in str(plan.strategy_name) else ('pb2' if plan.pullback_v2_ok else 'trend')
+            return f'select_{selected}', selected
+        return 'hold', selected
+
+    def _build_decision_trace(
+        self,
+        *,
+        tick: dict,
+        symbol: str,
+        replay_clock: int,
+        plan: TradePlan,
+        final_action: str,
+        decision: str,
+        blockers: list[str],
+        primary_blocker: str | None,
+        position_open: bool,
+    ) -> dict:
+        router_status, selected = self._router_status(plan)
+        setup_confirmed = bool(plan.side in ('BUY', 'SELL') and plan.decision in ('enter_long', 'enter_short'))
+        evaluated = [
+            {'strategy': 'trend', 'evaluated': True, 'reason': 'baseline'},
+            {'strategy': 'breakout', 'evaluated': bool(settings.feature_breakout), 'reason': 'feature_on' if settings.feature_breakout else 'feature_off'},
+            {'strategy': 'pb2', 'evaluated': bool(settings.feature_pullback_v2), 'reason': 'feature_on' if settings.feature_pullback_v2 else 'feature_off'},
+        ]
+        entry_eligibility = bool(
+            (plan.side in ('BUY', 'SELL')) and (decision != 'BLOCKED') and not position_open and final_action in {'ENTER', 'SIGNAL_LONG', 'SIGNAL_SHORT'}
+        )
+        size_reasons = [r for r in (plan.reasons or []) if r in {'trend_bonus', 'chop_penalty', 'vol_high_boost', 'vol_low_penalty', 'vol_cap_applied', 'vol_sizing_on'}]
+        return {
+            'timestamp': tick.get('timestamp'),
+            'symbol': symbol,
+            'bar_index': replay_clock,
+            'router': {
+                'evaluated': evaluated,
+                'selected': selected,
+                'decision_status': router_status,
+            },
+            'regime_gate': {
+                'pass': bool(plan.regime_gate_ok),
+                'fail_reasons': list(plan.regime_gate_reasons or []),
+                'metrics': dict(plan.regime_gate_metrics or {}),
+            },
+            'setup_status': {
+                'setup_confirmed': setup_confirmed,
+                'reasons': [r for r in (plan.reasons or []) if 'setup' in str(r) or 'pb2_' in str(r) or 'breakout_' in str(r)],
+            },
+            'scoring': {
+                'score': float(plan.score_total),
+                'score_min': float(settings.score_min),
+                'components': dict(plan.score_components or {}),
+            },
+            'feature_flags': {
+                'FEATURE_BREAKOUT': bool(settings.feature_breakout),
+                'FEATURE_PULLBACK_V2': bool(settings.feature_pullback_v2),
+                'FEATURE_VOL_SIZING': bool(settings.feature_vol_sizing),
+            },
+            'risk_sizing': {
+                'base_qty': float(plan.base_qty),
+                'multiplier': float(plan.size_mult),
+                'final_qty': float(plan.final_qty),
+                'cap_applied': 'vol_cap_applied' in size_reasons,
+                'reason_tags': size_reasons,
+            },
+            'entry_eligibility': entry_eligibility,
+            'final_action': final_action,
+            'trade_blocker_primary': primary_blocker,
+            'trade_blockers': blockers,
+        }
+
+    def _record_decision_trace(self, trace: dict) -> None:
+        self._decision_traces.append(trace)
+        summary = self._trace_summary
+        summary['total_bars'] = int(summary['total_bars']) + 1
+        if trace.get('regime_gate', {}).get('pass'):
+            summary['regime_pass'] = int(summary['regime_pass']) + 1
+        else:
+            summary['regime_fail'] = int(summary['regime_fail']) + 1
+        if trace.get('setup_status', {}).get('setup_confirmed'):
+            summary['setup_confirmed_true'] = int(summary['setup_confirmed_true']) + 1
+        else:
+            summary['setup_confirmed_false'] = int(summary['setup_confirmed_false']) + 1
+        router_selected = str(trace.get('router', {}).get('selected') or 'none')
+        cast_router = summary['router_selected']
+        if isinstance(cast_router, Counter):
+            cast_router[router_selected] += 1
+        blockers_counter = summary['blockers']
+        if isinstance(blockers_counter, Counter):
+            for blocker in trace.get('trade_blockers') or []:
+                blockers_counter[str(blocker)] += 1
+        gov_counter = summary['governor_blockers']
+        if isinstance(gov_counter, Counter) and 'governor_block' in (trace.get('trade_blockers') or []):
+            for blocker in trace.get('trade_blockers') or []:
+                if blocker.startswith('gov_') or blocker in {'governor_block'}:
+                    gov_counter[str(blocker)] += 1
+        score_ge_no_trade = summary['score_ge_min_no_trade']
+        if isinstance(score_ge_no_trade, Counter):
+            if float(trace.get('scoring', {}).get('score') or 0.0) >= float(trace.get('scoring', {}).get('score_min') or 0.0) and trace.get('final_action') not in {'ENTER', 'EXIT', 'PARTIAL'}:
+                score_ge_no_trade[str(trace.get('trade_blocker_primary') or 'none')] += 1
+        if trace.get('final_action') == 'ENTER':
+            bars = summary['entry_bars']
+            if isinstance(bars, list):
+                bars.append({'bar_index': int(trace.get('bar_index') or 0), 'timestamp': trace.get('timestamp')})
+
+    def observability_snapshot(self, last_n: int = 100) -> dict:
+        traces = list(self._decision_traces)[-max(1, int(last_n)) :]
+        summary = self._trace_summary
+        total_bars = int(summary['total_bars']) if summary.get('total_bars') is not None else 0
+        blockers = summary['blockers'] if isinstance(summary.get('blockers'), Counter) else Counter()
+        score_ge = summary['score_ge_min_no_trade'] if isinstance(summary.get('score_ge_min_no_trade'), Counter) else Counter()
+        gov = summary['governor_blockers'] if isinstance(summary.get('governor_blockers'), Counter) else Counter()
+        no_trade = self._diagnose_no_trade_streak()
+        return {
+            'replay': self.replay_status(),
+            'decision_traces': traces,
+            'blocker_counters': {
+                'total_bars': total_bars,
+                'regime_pass': int(summary.get('regime_pass') or 0),
+                'regime_fail': int(summary.get('regime_fail') or 0),
+                'setup_confirmed_true': int(summary.get('setup_confirmed_true') or 0),
+                'setup_confirmed_false': int(summary.get('setup_confirmed_false') or 0),
+                'router_selected': dict(summary.get('router_selected') or {}),
+                'blockers_ranked': [
+                    {'blocker': name, 'count': count, 'pct_total_bars': (count / total_bars * 100.0) if total_bars else 0.0}
+                    for name, count in blockers.most_common()
+                ],
+                'governor_blocks': dict(gov),
+                'score_ge_min_no_trade': dict(score_ge),
+            },
+            'no_trade_streak': no_trade,
+        }
+
+    def _diagnose_no_trade_streak(self) -> dict:
+        traces = list(self._decision_traces)
+        if not traces:
+            return {
+                'length_bars': 0,
+                'length_days': 0.0,
+                'start_ts': None,
+                'end_ts': None,
+                'top_blockers': [],
+                'pass_rate_in_streak_pct': None,
+                'pass_rate_outside_streak_pct': None,
+            }
+        best = (0, 0, -1)
+        start = 0
+        in_run = False
+        for i, row in enumerate(traces):
+            if row.get('final_action') != 'ENTER':
+                if not in_run:
+                    in_run = True
+                    start = i
+            else:
+                if in_run and (i - start) > best[0]:
+                    best = (i - start, start, i - 1)
+                in_run = False
+        if in_run and (len(traces) - start) > best[0]:
+            best = (len(traces) - start, start, len(traces) - 1)
+        if best[0] <= 0:
+            return {
+                'length_bars': 0,
+                'length_days': 0.0,
+                'start_ts': None,
+                'end_ts': None,
+                'top_blockers': [],
+                'pass_rate_in_streak_pct': None,
+                'pass_rate_outside_streak_pct': None,
+            }
+        streak = traces[best[1] : best[2] + 1]
+        blocker_counter: Counter[str] = Counter()
+        for row in streak:
+            for blocker in row.get('trade_blockers') or []:
+                blocker_counter[str(blocker)] += 1
+        pass_in = sum(1 for row in streak if row.get('regime_gate', {}).get('pass'))
+        outside = traces[: best[1]] + traces[best[2] + 1 :]
+        pass_out = sum(1 for row in outside if row.get('regime_gate', {}).get('pass'))
+        start_ts = streak[0].get('timestamp')
+        end_ts = streak[-1].get('timestamp')
+        length_days = 0.0
+        try:
+            if start_ts and end_ts:
+                length_days = max(0.0, (float(end_ts) - float(start_ts)) / 86400.0)
+        except Exception:
+            length_days = 0.0
+        return {
+            'length_bars': best[0],
+            'length_days': length_days,
+            'start_ts': start_ts,
+            'end_ts': end_ts,
+            'top_blockers': [{'blocker': k, 'count': v} for k, v in blocker_counter.most_common(5)],
+            'pass_rate_in_streak_pct': (pass_in / len(streak) * 100.0) if streak else None,
+            'pass_rate_outside_streak_pct': (pass_out / len(outside) * 100.0) if outside else None,
+        }
 
     async def _partial_close(
         self,
@@ -971,6 +1241,11 @@ class EngineService:
                     'size_mult': plan.size_mult,
                     'final_qty': plan.final_qty,
                     'blockers': dedup_blockers,
+                    'final_action': 'STAND_DOWN' if plan.active_mode == 'STAND_DOWN' else ('SIGNAL_LONG' if plan.decision == 'enter_long' else ('SIGNAL_SHORT' if plan.decision == 'enter_short' else 'HOLD')),
+                    'entry_eligibility': bool(plan.decision in ('enter_long', 'enter_short')),
+                    'router_selected_strategy': 'breakout' if 'breakout' in str(plan.strategy_name) else ('pb2' if plan.pullback_v2_ok else ('trend' if plan.decision in ('enter_long', 'enter_short') else 'none')),
+                    'trade_blocker_primary': dedup_blockers[0] if dedup_blockers else None,
+                    'trade_blockers': dedup_blockers,
                 },
             )
         )

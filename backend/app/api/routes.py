@@ -139,6 +139,14 @@ async def replay_status(engine: EngineService = Depends(get_engine_service)) -> 
     return engine.replay_status()
 
 
+@router.get('/replay/observability')
+async def replay_observability(
+    n: int = Query(default=100, ge=1, le=5000),
+    engine: EngineService = Depends(get_engine_service),
+) -> dict:
+    return engine.observability_snapshot(last_n=n)
+
+
 @router.post('/replay/upload')
 async def replay_upload(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)) -> dict:
     dataset_id, stored_path, metadata = await persist_upload(file=file, data_dir=settings.data_dir)
@@ -406,7 +414,21 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
             'regime_gate_metrics': snapshot.get('regime_gate_metrics') if isinstance(snapshot, dict) else None,
             'active_mode': snapshot.get('active_mode') if isinstance(snapshot, dict) else None,
             'mode_reasons': snapshot.get('mode_reasons') if isinstance(snapshot, dict) else None,
+            'final_action': snapshot.get('final_action') if isinstance(snapshot, dict) else None,
+            'entry_eligibility': snapshot.get('entry_eligibility') if isinstance(snapshot, dict) else None,
+            'router_selected_strategy': snapshot.get('router_selected_strategy') if isinstance(snapshot, dict) else None,
+            'trade_blocker_primary': snapshot.get('trade_blocker_primary') if isinstance(snapshot, dict) else None,
+            'trade_blockers': snapshot.get('trade_blockers') if isinstance(snapshot, dict) else None,
         }
+
+    obs_latest = engine.observability_snapshot(last_n=1).get('decision_traces', [])
+    if obs_latest:
+        latest_trace = obs_latest[-1]
+        latest_decision['final_action'] = latest_trace.get('final_action')
+        latest_decision['entry_eligibility'] = latest_trace.get('entry_eligibility')
+        latest_decision['router_selected_strategy'] = latest_trace.get('router', {}).get('selected')
+        latest_decision['trade_blocker_primary'] = latest_trace.get('trade_blocker_primary')
+        latest_decision['trade_blockers'] = latest_trace.get('trade_blockers')
 
     gov_now = None
     if replay_payload.get('candle_ts'):

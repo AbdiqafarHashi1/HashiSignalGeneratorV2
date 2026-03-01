@@ -883,6 +883,11 @@ export default function Page() {
             <div className='rounded border border-zinc-800 px-2 py-1'>mode_reasons: {modeReasons.length ? modeReasons.join(', ') : 'n/a'}</div>
             <div className='flex justify-between'><span>Regime</span><span className='rounded border border-zinc-700 px-2 py-0.5'>{text(overview?.latest_decision?.regime)}</span></div>
             <div className='flex justify-between font-mono'><span>Decision</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.decision || overview?.latest_decision?.decision)}</span></div>
+            <div className='flex justify-between font-mono'><span>Final Action</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.final_action || overview?.latest_decision?.final_action)}</span></div>
+            <div className='flex justify-between'><span>Entry Eligibility</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.entry_eligibility ?? overview?.latest_decision?.entry_eligibility)}</span></div>
+            <div className='flex justify-between'><span>Router Strategy</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.router_selected_strategy || overview?.latest_decision?.router_selected_strategy)}</span></div>
+            <div className='flex justify-between'><span>Trade Blocker (primary)</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.trade_blocker_primary || overview?.latest_decision?.trade_blocker_primary)}</span></div>
+            <div className='rounded border border-zinc-800 px-2 py-1'><span>Trade Blockers: {Array.isArray(latestDecisionEvent?.risk_state_snapshot?.trade_blockers) && latestDecisionEvent.risk_state_snapshot.trade_blockers.length ? latestDecisionEvent.risk_state_snapshot.trade_blockers.join(', ') : Array.isArray(overview?.latest_decision?.trade_blockers) && overview.latest_decision.trade_blockers.length ? overview.latest_decision.trade_blockers.join(', ') : 'n/a'}</span></div>
             <div className='flex justify-between'><span>Score</span><span>{fmtNum(latestDecisionEvent?.risk_state_snapshot?.score_total ?? overview?.latest_decision?.score, 2)}</span></div>
             <div className='grid grid-cols-1 gap-1'>
               <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>trend_strength</span><span>{fmtNum(regimeGateMetrics?.trend_strength, 3)}</span></div>
