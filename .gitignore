@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node / Next
+node_modules/
+.next/
+dist/
+
+# Local datasets
+data/uploads/*.csv
+data/datasets/*.csv

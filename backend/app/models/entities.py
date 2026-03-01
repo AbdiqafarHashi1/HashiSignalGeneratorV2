@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -28,6 +28,27 @@ class Trade(TimestampUUIDMixin, Base):
     quantity: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     entry_price: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     exit_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    stop_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    tp1_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    tp2_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    time_stop_bars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    setup_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    regime_at_entry: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    score_at_entry: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    close_reason: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    fee_entry: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    fee_exit: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    fees_total: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    pnl_gross: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    pnl_net: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    leverage: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    notional: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    base_qty: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    size_mult: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    final_qty: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default='OPEN', index=True)
 
@@ -81,6 +102,31 @@ class RiskEvent(TimestampUUIDMixin, Base):
     level: Mapped[str] = mapped_column(String(16), index=True)
     message: Mapped[str] = mapped_column(Text)
     context: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+
+class ReplayDataset(TimestampUUIDMixin, Base):
+    __tablename__ = 'replay_datasets'
+
+    filename: Mapped[str] = mapped_column(String(255))
+    stored_path: Mapped[str] = mapped_column(Text, unique=True)
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    timeframe: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    rows_count: Mapped[int] = mapped_column(BigInteger, default=0)
+    start_ts: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    end_ts: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class DecisionEvent(TimestampUUIDMixin, Base):
+    __tablename__ = 'decision_events'
+
+    ts: Mapped[int] = mapped_column(BigInteger, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    regime: Mapped[str] = mapped_column(String(64), default='unknown')
+    signal_score: Mapped[float] = mapped_column(Numeric(12, 6), default=0)
+    decision: Mapped[str] = mapped_column(String(24), index=True)
+    blockers: Mapped[list] = mapped_column(JSONB, default=list)
+    rationale: Mapped[str] = mapped_column(Text, default='')
+    risk_state_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)
 
 
 class TelegramLog(TimestampUUIDMixin, Base):
