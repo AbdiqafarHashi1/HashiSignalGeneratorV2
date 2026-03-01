@@ -269,6 +269,9 @@ async def list_trades(
                 'pnl_net': float(row.pnl_net) if row.pnl_net is not None else None,
                 'leverage': float(row.leverage) if row.leverage is not None else None,
                 'notional': float(row.notional) if row.notional is not None else None,
+                'base_qty': float(row.base_qty) if row.base_qty is not None else None,
+                'size_mult': float(row.size_mult) if row.size_mult is not None else None,
+                'final_qty': float(row.final_qty) if row.final_qty is not None else None,
                 'status': row.status,
                 'created_at': row.created_at,
             }
@@ -361,8 +364,17 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
     progress_ratio = (progress_pct / target_pct) if target_pct else 0.0
 
     latest = (
-        await db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1))
+        await db.execute(
+            select(DecisionEvent)
+            .where(DecisionEvent.decision == 'DECISION')
+            .order_by(desc(DecisionEvent.created_at))
+            .limit(1)
+        )
     ).scalar_one_or_none()
+    if not latest:
+        latest = (
+            await db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1))
+        ).scalar_one_or_none()
     latest_decision = {
         'ts': None,
         'symbol': None,
@@ -371,9 +383,16 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
         'score': None,
         'message': None,
         'blockers_top': None,
+        'regime_gate_ok': None,
+        'top_regime_gate_reasons': None,
+        'regime_gate_metrics': None,
+        'active_mode': None,
+        'mode_reasons': None,
     }
     if latest:
         ts_iso = datetime.fromtimestamp((latest.ts or 0) / 1000, tz=timezone.utc).isoformat() if latest.ts else None
+        snapshot = latest.risk_state_snapshot or {}
+        rg_reasons = snapshot.get('regime_gate_reasons') if isinstance(snapshot, dict) else None
         latest_decision = {
             'ts': ts_iso,
             'symbol': latest.symbol,
@@ -382,6 +401,11 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
             'score': float(latest.signal_score) if latest.signal_score is not None else None,
             'message': latest.rationale,
             'blockers_top': (latest.blockers or [])[:5] if latest.blockers is not None else None,
+            'regime_gate_ok': snapshot.get('regime_gate_ok') if isinstance(snapshot, dict) else None,
+            'top_regime_gate_reasons': (rg_reasons or [])[:2] if isinstance(rg_reasons, list) else None,
+            'regime_gate_metrics': snapshot.get('regime_gate_metrics') if isinstance(snapshot, dict) else None,
+            'active_mode': snapshot.get('active_mode') if isinstance(snapshot, dict) else None,
+            'mode_reasons': snapshot.get('mode_reasons') if isinstance(snapshot, dict) else None,
         }
 
     gov_now = None

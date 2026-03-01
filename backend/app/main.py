@@ -62,6 +62,9 @@ async def _upgrade_trade_columns(conn: AsyncConnection) -> None:
     await conn.execute(text('ALTER TABLE trades ADD COLUMN IF NOT EXISTS setup_name VARCHAR(64)'))
     await conn.execute(text('ALTER TABLE trades ADD COLUMN IF NOT EXISTS regime_at_entry VARCHAR(32)'))
     await conn.execute(text('ALTER TABLE trades ADD COLUMN IF NOT EXISTS score_at_entry NUMERIC(12, 6)'))
+    await conn.execute(text('ALTER TABLE trades ADD COLUMN IF NOT EXISTS base_qty NUMERIC(20, 8)'))
+    await conn.execute(text('ALTER TABLE trades ADD COLUMN IF NOT EXISTS size_mult NUMERIC(12, 6)'))
+    await conn.execute(text('ALTER TABLE trades ADD COLUMN IF NOT EXISTS final_qty NUMERIC(20, 8)'))
 
 
 @asynccontextmanager

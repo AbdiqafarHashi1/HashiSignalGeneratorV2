@@ -17,7 +17,6 @@ node_modules/
 .next/
 dist/
 
-# Local datasets (if you ever copy them in)
-data/
-datasets/
-*.csv
+# Local datasets
+data/uploads/*.csv
+data/datasets/*.csv

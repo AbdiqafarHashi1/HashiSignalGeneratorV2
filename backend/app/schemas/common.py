@@ -50,6 +50,9 @@ class TradeRead(BaseModel):
     pnl_net: float | None = None
     leverage: float | None = None
     notional: float | None = None
+    base_qty: float | None = None
+    size_mult: float | None = None
+    final_qty: float | None = None
     pnl: float | None
     fees: float | None = None
     status: str

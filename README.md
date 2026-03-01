@@ -39,6 +39,19 @@ cd backend
 pytest
 ```
 
+## Build 15m Dataset From Master 5m
+```bash
+python backend/scripts/build_15m_from_5m.py
+python backend/scripts/smoke_build_dataset.py
+```
+
+Defaults:
+- Input: `data/uploads/ETHUSDT_5m_master.csv`
+- Output: `data/datasets/ETHUSDT_15m.csv`
+- Optional env default selection:
+  - `REPLAY_DATASET_DEFAULT=data/datasets/ETHUSDT_15m.csv`
+  - `NEXT_PUBLIC_REPLAY_DATASET_DEFAULT=data/datasets/ETHUSDT_15m.csv`
+
 ## How To Verify
 1. `docker compose up --build`
 2. Upload a dataset from the dashboard.
@@ -165,3 +178,52 @@ Notes:
 8. Activity and Equity Curve derive from normalized trades.
 9. Reconcile tile shows `OK` only when `abs(delta) < 0.01`; otherwise shows `Delta ...`.
 10. Mobile has no page horizontal overflow; only table/feed areas scroll.
+
+## Step 14A Regime Gate Verification
+1. Run replay twice with the same CSV and identical `.env`; compare trade count and PnL to confirm deterministic outputs.
+2. Confirm `GET /events` `DECISION` rows include regime gate fields in `risk_state_snapshot`:
+   - `regime_gate_ok`
+   - `regime_gate_reasons`
+   - `regime_gate_metrics`
+3. Confirm when gate blocks entries, decision remains `hold` and blockers include `regime_gate:*`.
+4. Confirm `GET /overview` -> `latest_decision` includes:
+   - `regime_gate_ok`
+   - `top_regime_gate_reasons`
+   - `regime_gate_metrics`
+5. Compare replay windows before/after with same dataset and check trade frequency and PF from existing `/trades` statistics.
+
+### Regime Gate Flags (15m Replay)
+- `REGIME_REQUIRE_HTF=false`
+- `REGIME_ALLOW_LTF_FALLBACK=true`
+- `REGIME_MIN_LTF_BARS=250`
+- `REGIME_HTF_TIMEFRAME=4h`
+
+Recommended for `ETHUSDT_15m.csv` replay:
+- Keep HTF optional (`REGIME_REQUIRE_HTF=false`) to avoid deadlock when HTF slope is unavailable.
+- Keep LTF fallback enabled (`REGIME_ALLOW_LTF_FALLBACK=true`) so gate can classify with LTF metrics.
+
+## Step 15 Feature Flags (Breakout / Pullback v2 / Vol Sizing)
+New additive flags (default OFF):
+- `FEATURE_BREAKOUT=false`
+- `FEATURE_PULLBACK_V2=false`
+- `FEATURE_VOL_SIZING=false`
+
+When all three flags are `false`, strategy behavior remains baseline `TREND_STABLE`.
+
+Enable examples:
+- Breakout only: `FEATURE_BREAKOUT=true`
+- Pullback v2 only: `FEATURE_PULLBACK_V2=true`
+- Vol sizing only: `FEATURE_VOL_SIZING=true`
+- All: set all three to `true`
+
+Smoke fingerprint runner:
+```bash
+python backend/scripts/smoke_strategy_feature_flags.py --csv data/datasets/ETHUSDT_15m.csv
+```
+It runs:
+1) baseline twice (asserts deterministic equality)
+2) breakout-only
+3) pullback-v2-only
+4) vol-sizing-only
+5) all-enabled
+and prints trade-count/PnL/fees/win-rate/trade-hash fingerprints.

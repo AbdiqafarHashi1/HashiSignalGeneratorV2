@@ -24,6 +24,9 @@ import { executeCloseNow, executeReduceHalf } from '../lib/execution';
 
 type EventFilter = 'ALL' | 'DECISION' | 'SIGNAL' | 'BLOCKED' | 'ENTRY' | 'PARTIAL' | 'EXIT' | 'ERROR';
 const PROFILE_OPTIONS = ['TREND_STABLE', 'SCALPER_STABLE'] as const;
+const DEFAULT_REPLAY_DATASET =
+  (process.env.NEXT_PUBLIC_REPLAY_DATASET_DEFAULT as string | undefined) ||
+  'data/datasets/ETHUSDT_15m.csv';
 type EndpointKey = 'overview' | 'trades' | 'events' | 'positions';
 type FetchMeta = {
   lastOkAt: number | null;
@@ -403,7 +406,17 @@ export default function Page() {
     try {
       const ds = await fetchDatasets();
       setDatasets(ds || []);
-      setSelectedDatasetId((prev) => prev || ds?.[0]?.id || '');
+      setSelectedDatasetId((prev) => {
+        if (prev) return prev;
+        const preferred = String(DEFAULT_REPLAY_DATASET || '').replace(/\\/g, '/').toLowerCase();
+        const preferredName = preferred.split('/').pop() || preferred;
+        const match = (ds || []).find((row: any) => {
+          const filename = String(row?.filename || '').toLowerCase();
+          const storedPath = String(row?.stored_path || '').replace(/\\/g, '/').toLowerCase();
+          return filename === preferredName || storedPath.endsWith(preferred) || storedPath.endsWith(`/${preferredName}`);
+        });
+        return String(match?.id || ds?.[0]?.id || '');
+      });
       setError('');
     } catch (e: any) {
       setError(errorText(e));
@@ -487,6 +500,24 @@ export default function Page() {
   const latestExit = useMemo(() => events.find((e) => String(e?.event_type || '').toUpperCase() === 'EXIT') || null, [events]);
   const latestEntry = useMemo(() => events.find((e) => String(e?.event_type || '').toUpperCase() === 'ENTRY') || null, [events]);
   const latestDecisionEvent = useMemo(() => events.find((e) => String(e?.event_type || '').toUpperCase() === 'DECISION') || null, [events]);
+  const latestDecisionSnapshot = useMemo(
+    () => latestDecisionEvent?.risk_state_snapshot || {},
+    [latestDecisionEvent],
+  );
+  const regimeGateOk = latestDecisionSnapshot?.regime_gate_ok ?? overview?.latest_decision?.regime_gate_ok ?? null;
+  const regimeGateReasons: string[] =
+    (Array.isArray(latestDecisionSnapshot?.regime_gate_reasons) ? latestDecisionSnapshot.regime_gate_reasons : null) ||
+    (Array.isArray(overview?.latest_decision?.top_regime_gate_reasons) ? overview.latest_decision.top_regime_gate_reasons : []) ||
+    [];
+  const regimeGateMetrics = latestDecisionSnapshot?.regime_gate_metrics || overview?.latest_decision?.regime_gate_metrics || {};
+  const activeMode = latestDecisionSnapshot?.active_mode || overview?.latest_decision?.active_mode;
+  const modeReasons: string[] =
+    (Array.isArray(latestDecisionSnapshot?.mode_reasons) ? latestDecisionSnapshot.mode_reasons : null) ||
+    (Array.isArray(overview?.latest_decision?.mode_reasons) ? overview.latest_decision.mode_reasons : []) ||
+    [];
+  const regimeWarmup = regimeGateReasons.some((reason) => String(reason).includes('ltf_warmup'));
+  const regimeFallbackUsed = regimeGateReasons.some((reason) => String(reason).includes('htf_missing_fallback_used'));
+  const ltfBarsRemaining = Number(regimeGateMetrics?.ltf_bars_remaining);
 
   const filteredEvents = useMemo(() => {
     const sorted = [...events].sort((a, b) => {
@@ -836,9 +867,35 @@ export default function Page() {
         <div className='rounded-lg border border-zinc-800 bg-zinc-950 p-4'>
           <h2 className='text-lg font-semibold mb-2'>Signal / Reasoning</h2>
           <div className='space-y-2 text-xs'>
+            <div className='flex justify-between'><span>Regime Gate</span><span className={`rounded border px-2 py-0.5 ${regimeGateOk === true ? 'border-emerald-700 text-emerald-300' : regimeGateOk === false ? 'border-rose-700 text-rose-300' : 'border-zinc-700 text-zinc-300'}`}>{regimeGateOk === true ? 'PASS' : regimeGateOk === false ? 'FAIL' : '-'}</span></div>
+            {regimeWarmup && (
+              <div className='rounded border border-amber-800 bg-amber-950/20 px-2 py-1'>
+                Warmup (LTF){Number.isFinite(ltfBarsRemaining) ? ` - ~${Math.max(0, Math.round(ltfBarsRemaining))} bars remaining` : ''}
+              </div>
+            )}
+            {regimeFallbackUsed && (
+              <div className='rounded border border-zinc-700 bg-zinc-900 px-2 py-1'>
+                HTF missing: using LTF fallback
+              </div>
+            )}
+            {regimeGateOk === false && regimeGateReasons.length > 0 && !regimeWarmup && <div className='rounded border border-rose-800 bg-rose-950/20 px-2 py-1'>Gate reasons: {regimeGateReasons.slice(0, 2).join(', ')}</div>}
+            <div className='flex justify-between'><span>Active mode</span><span className='rounded border border-zinc-700 px-2 py-0.5'>{text(activeMode)}</span></div>
+            <div className='rounded border border-zinc-800 px-2 py-1'>mode_reasons: {modeReasons.length ? modeReasons.join(', ') : 'n/a'}</div>
             <div className='flex justify-between'><span>Regime</span><span className='rounded border border-zinc-700 px-2 py-0.5'>{text(overview?.latest_decision?.regime)}</span></div>
             <div className='flex justify-between font-mono'><span>Decision</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.decision || overview?.latest_decision?.decision)}</span></div>
             <div className='flex justify-between'><span>Score</span><span>{fmtNum(latestDecisionEvent?.risk_state_snapshot?.score_total ?? overview?.latest_decision?.score, 2)}</span></div>
+            <div className='grid grid-cols-1 gap-1'>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>trend_strength</span><span>{fmtNum(regimeGateMetrics?.trend_strength, 3)}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>atr_pct</span><span>{fmtNum(regimeGateMetrics?.atr_pct, 3)}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>{regimeGateMetrics?.adx !== undefined && regimeGateMetrics?.adx !== null ? 'adx' : 'chop_ratio'}</span><span>{fmtNum(regimeGateMetrics?.adx ?? regimeGateMetrics?.chop_ratio, 3)}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>atr_expand_ratio</span><span>{fmtNum(regimeGateMetrics?.atr_expand_ratio, 3)}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>htf_slope_pct</span><span>{regimeGateMetrics?.htf_slope_pct === null || regimeGateMetrics?.htf_slope_pct === undefined ? 'n/a' : fmtNum(regimeGateMetrics?.htf_slope_pct, 4)}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>box_high/box_low</span><span>{text(latestDecisionSnapshot?.breakout_box_high)} / {text(latestDecisionSnapshot?.breakout_box_low)}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>compression/recent</span><span>{text(latestDecisionSnapshot?.breakout_compression)} / {text(latestDecisionSnapshot?.breakout_recent)}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>pullback_v2</span><span>{text(latestDecisionSnapshot?.pullback_v2_ok)}</span></div>
+              <div className='rounded border border-zinc-800 px-2 py-1'><span>pb2_reasons: {Array.isArray(latestDecisionSnapshot?.pullback_v2_reasons) && latestDecisionSnapshot.pullback_v2_reasons.length ? latestDecisionSnapshot.pullback_v2_reasons.join(', ') : 'n/a'}</span></div>
+              <div className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>size base/mult/final</span><span>{fmtNum(latestDecisionSnapshot?.base_qty, 4)} / {fmtNum(latestDecisionSnapshot?.size_mult, 3)} / {fmtNum(latestDecisionSnapshot?.final_qty, 4)}</span></div>
+            </div>
             <div className='h-1.5 rounded bg-zinc-800 overflow-hidden'><div className='h-1.5 bg-zinc-500' style={{ width: `${Math.max(0, Math.min(100, Number(latestDecisionEvent?.risk_state_snapshot?.score_total ?? overview?.latest_decision?.score ?? 0)))}%` }} /></div>
             <div className='space-y-1'><div className='text-zinc-400'>Components</div>{latestDecisionEvent?.risk_state_snapshot?.score_components ? Object.entries(latestDecisionEvent.risk_state_snapshot.score_components).map(([k, v]) => <div key={k} className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>{k}</span><span>{fmtNum(v, 3)}</span></div>) : <div className='text-zinc-500'>No component payload</div>}</div>
             <div className='space-y-1'><div className='text-zinc-400'>Reasons</div>{(latestDecisionEvent?.risk_state_snapshot?.reasons || []).length ? (latestDecisionEvent.risk_state_snapshot.reasons as string[]).map((r, i) => <div key={`${r}-${i}`} className='rounded border border-zinc-800 px-2 py-1 font-mono'>{r}</div>) : <div className='text-zinc-500'>No reasons payload</div>}</div>

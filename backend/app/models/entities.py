@@ -46,6 +46,9 @@ class Trade(TimestampUUIDMixin, Base):
     pnl_net: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     leverage: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     notional: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    base_qty: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    size_mult: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    final_qty: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default='OPEN', index=True)
 

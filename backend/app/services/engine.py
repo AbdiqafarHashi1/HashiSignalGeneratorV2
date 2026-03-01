@@ -302,7 +302,7 @@ class EngineService:
             }
         )
         history = self._history_by_symbol[symbol]
-        plan = self.strategy_v1.build_plan(history, self.replay_timeframe)
+        plan = self.strategy_v1.build_plan(history, self.replay_timeframe, replay_clock)
 
         async with self.session_factory() as db:
             await self._check_day_rollover(ts=ts_dt, db=db, symbol=symbol, ts_ms=ts_ms)
@@ -364,6 +364,7 @@ class EngineService:
                         decision='BLOCKED',
                         plan=plan,
                         blockers=blockers,
+                        extra_blockers=plan.blockers,
                         rationale='Entry blocked by kill switch',
                     )
                     await db.commit()
@@ -419,6 +420,7 @@ class EngineService:
                 decision=decision.upper() if decision != 'hold' else 'HOLD',
                 plan=plan,
                 blockers=blockers,
+                extra_blockers=plan.blockers,
                 rationale=rationale,
             )
             await db.commit()
@@ -483,6 +485,9 @@ class EngineService:
             fees_total=fee,
             leverage=Decimal(str(plan.leverage)),
             notional=notional,
+            base_qty=Decimal(str(plan.base_qty)),
+            size_mult=Decimal(str(plan.size_mult)),
+            final_qty=Decimal(str(plan.final_qty)),
             status='OPEN',
         )
         db.add(trade)
@@ -533,6 +538,17 @@ class EngineService:
                 'score_total': float(plan.score_total),
                 'score_components': plan.score_components,
                 'reasons': plan.reasons,
+                'active_mode': plan.active_mode,
+                'mode_reasons': plan.mode_reasons,
+                'breakout_box_high': plan.breakout_box_high,
+                'breakout_box_low': plan.breakout_box_low,
+                'breakout_compression': plan.breakout_compression,
+                'breakout_recent': plan.breakout_recent,
+                'pullback_v2_ok': plan.pullback_v2_ok,
+                'pullback_v2_reasons': plan.pullback_v2_reasons,
+                'base_qty': plan.base_qty,
+                'size_mult': plan.size_mult,
+                'final_qty': plan.final_qty,
             },
         )
 
@@ -913,8 +929,13 @@ class EngineService:
         decision: str,
         plan: TradePlan,
         blockers: list[dict],
+        extra_blockers: list[str] | None,
         rationale: str,
     ) -> None:
+        merged_blockers: list[str] = []
+        merged_blockers.extend([str(b.get('name')) for b in blockers] if blockers else [])
+        merged_blockers.extend([str(b) for b in (extra_blockers or []) if b])
+        dedup_blockers = sorted(set(merged_blockers))
         db.add(
             DecisionEvent(
                 ts=ts_ms,
@@ -922,7 +943,7 @@ class EngineService:
                 regime=plan.regime,
                 signal_score=float(plan.score_total),
                 decision='DECISION',
-                blockers=[str(b.get('name')) for b in blockers] if blockers else [],
+                blockers=dedup_blockers,
                 rationale=rationale,
                 risk_state_snapshot={
                     'event_type': 'DECISION',
@@ -933,6 +954,23 @@ class EngineService:
                     'strategy_name': plan.strategy_name,
                     'setup_name': plan.setup_name,
                     'regime': plan.regime,
+                    'regime_state': plan.regime_state,
+                    'regime_direction': plan.regime_direction,
+                    'regime_gate_ok': plan.regime_gate_ok,
+                    'regime_gate_reasons': plan.regime_gate_reasons,
+                    'regime_gate_metrics': plan.regime_gate_metrics,
+                    'active_mode': plan.active_mode,
+                    'mode_reasons': plan.mode_reasons,
+                    'breakout_box_high': plan.breakout_box_high,
+                    'breakout_box_low': plan.breakout_box_low,
+                    'breakout_compression': plan.breakout_compression,
+                    'breakout_recent': plan.breakout_recent,
+                    'pullback_v2_ok': plan.pullback_v2_ok,
+                    'pullback_v2_reasons': plan.pullback_v2_reasons,
+                    'base_qty': plan.base_qty,
+                    'size_mult': plan.size_mult,
+                    'final_qty': plan.final_qty,
+                    'blockers': dedup_blockers,
                 },
             )
         )
@@ -942,7 +980,10 @@ class EngineService:
                 'symbol': symbol,
                 'decision': decision,
                 'score_total': float(plan.score_total),
-                'blockers': [str(b.get('name')) for b in blockers] if blockers else [],
+                'blockers': dedup_blockers,
+                'regime_gate_ok': plan.regime_gate_ok,
+                'regime_state': plan.regime_state,
+                'active_mode': plan.active_mode,
             },
         )
 
