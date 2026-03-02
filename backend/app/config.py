@@ -15,6 +15,9 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = ''
     telegram_chat_id: str = ''
+    telegram_enabled: bool | None = None
+    telegram_status_interval_min: int = 60
+    telegram_no_trade_interval_min: int = 30
     data_dir: str = '/data'
     equity_start: float = 100000.0
     monthly_target_pct: float = 6.0
