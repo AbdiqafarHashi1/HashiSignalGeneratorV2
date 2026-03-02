@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter, deque
 from datetime import datetime, timezone
+import logging
 from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -23,6 +24,10 @@ from app.services.governor import GovernorService
 from app.services.safety import KillSwitchMode, SafetyService
 from app.strategies.base import MomentumStrategy
 from app.strategies.trend_v1 import TradePlan, TrendPullbackStrategyV1
+from app.telegram.service import TelegramService
+
+
+logger = logging.getLogger(__name__)
 
 
 class EngineService:
@@ -74,22 +79,10 @@ class EngineService:
             'daily_fees': 0.0,
             'daily_trade_count': 0,
         }
-        self._decision_traces = deque(maxlen=max(10, int(settings.decision_trace_ring_size)))
-        self._lifecycle_events = deque(maxlen=max(20, int(settings.lifecycle_event_ring_size)))
-        self._trace_summary: dict[str, object] = {
-            'total_bars': 0,
-            'regime_pass': 0,
-            'regime_fail': 0,
-            'setup_confirmed_true': 0,
-            'setup_confirmed_false': 0,
-            'router_selected': Counter(),
-            'blockers': Counter(),
-            'governor_blockers': Counter(),
-            'score_ge_min_no_trade': Counter(),
-            'entry_bars': [],
-            'entry_blockers_when_regime_pass': Counter(),
-            'manage_reasons': Counter(),
-        }
+
+        self.telegram = TelegramService()
+        self.telegram.configure(self.session_factory)
+        self._last_overview_snapshot: dict | None = None
 
     async def start(self, mode: str = 'live') -> dict:
         await self._sync_profile_from_store()
@@ -143,6 +136,8 @@ class EngineService:
     ) -> dict:
         await self._sync_profile_from_store()
         cursor = self.replay.cursor if (self.replay and resume) else 0
+        if not resume:
+            await self._reset_runtime_state(clear_dataset=False)
         self.replay_symbol = dataset_symbol or settings.default_symbol
         self.replay_timeframe = dataset_timeframe
         self.replay = ReplayEngine(
@@ -176,13 +171,42 @@ class EngineService:
     async def stop_replay(self) -> dict:
         if self.replay:
             await self.replay.stop()
+        await self._reset_runtime_state(clear_dataset=False)
+        return await self.stop()
+
+    async def reset_replay(self) -> dict:
+        if self.replay:
+            await self.replay.stop()
+        self.replay = None
+        await self._reset_runtime_state(clear_dataset=True)
+        await self.stop()
+        return self.replay_status()
+
+    async def _reset_runtime_state(self, clear_dataset: bool) -> None:
         self._open_trade_id_by_symbol.clear()
         self._open_bar_by_symbol.clear()
         self._tp1_done_by_trade.clear()
         self._history_by_symbol.clear()
-        self._decision_traces.clear()
-        self._print_lifecycle_diagnostics()
-        return await self.stop()
+        self.tick = 0
+        self.last_event_at = None
+        self.last_day_key = None
+        self.day_rollover_in_effect = False
+        self.daily_state = {
+            'daily_consecutive_losses': 0,
+            'daily_realized_pnl': 0.0,
+            'daily_fees': 0.0,
+            'daily_trade_count': 0,
+        }
+        self.safety.reset_reconciler()
+        self._last_overview_snapshot = None
+        if clear_dataset:
+            self.replay_dataset_id = None
+            self.replay_symbol = settings.default_symbol
+            self.replay_timeframe = None
+        try:
+            await self.redis.delete('engine:state', 'engine:overview')
+        except Exception:
+            logger.debug('redis state clear failed', exc_info=True)
 
     async def pause_replay(self) -> dict:
         if self.replay:
@@ -258,6 +282,7 @@ class EngineService:
                 'current_ts': None,
                 'speed': 1.0,
                 'last_error': None,
+                'dataset_path': settings.replay_dataset_default,
             }
         status = self.replay.status()
         return {
@@ -269,6 +294,7 @@ class EngineService:
             'last_error': status['last_error'],
             'symbol': status.get('symbol') or self.replay_symbol,
             'timeframe': status.get('timeframe') or self.replay_timeframe,
+            'dataset_path': getattr(self.replay, 'csv_path', None),
         }
 
     async def _loop(self) -> None:
@@ -315,6 +341,7 @@ class EngineService:
                         evidence=runtime.evidence,
                     )
             await self._publish_state()
+            await self._notify_periodic_status()
             await asyncio.sleep(0.5)
 
     async def _next_tick(self, force_step: bool = False) -> dict | None:
@@ -1424,6 +1451,7 @@ class EngineService:
             )
         )
         self.safety.record_event(decision, payload)
+        await self._notify_trade_event(symbol=symbol, decision=decision, trade=trade, payload=payload)
 
     async def _emit_blocked_event(
         self,
@@ -1538,6 +1566,53 @@ class EngineService:
                 'active_mode': plan.active_mode,
             },
         )
+        await self._notify_decision_status(symbol=symbol, decision=decision, blockers=dedup_blockers, plan=plan)
+
+
+    async def _notify_trade_event(self, symbol: str, decision: str, trade: Trade, payload: dict) -> None:
+        if decision not in {'ENTRY', 'EXIT'}:
+            return
+        profile = self.active_profile
+        mode = 'REPLAY' if self.mode == 'replay' else 'LIVE'
+        header = f"[{mode}] {symbol} {profile}"
+        if decision == 'ENTRY':
+            body = (
+                f"{header}\n"
+                f"ENTRY {trade.side} qty={payload.get('qty')} @ {payload.get('price')}\n"
+                f"SL={payload.get('stop_price')} TP1={payload.get('tp1_price')} TP2={payload.get('tp2_price')}\n"
+                f"strategy={payload.get('strategy_name')} risk_pct_used={payload.get('size_mult')}"
+            )
+        else:
+            body = (
+                f"{header}\n"
+                f"EXIT reason={payload.get('reason')} pnl_net={payload.get('pnl_net')} fees={payload.get('fees_total')}\n"
+                f"equity? use /overview | dd={self.safety.reconciler_status().get('persisted_ms')}ms"
+            )
+        await self.telegram.enqueue('trade', body)
+
+    async def _notify_decision_status(self, symbol: str, decision: str, blockers: list[str], plan: TradePlan) -> None:
+        blocker_key = ','.join(blockers[:3]) if blockers else 'none'
+        if decision.lower() == 'hold' and self.telegram.should_send_no_trade(blocker_key):
+            mode = 'REPLAY' if self.mode == 'replay' else 'LIVE'
+            body = (
+                f"[{mode}] {symbol} {self.active_profile}\n"
+                f"No trade: blocker={blocker_key} active_mode={plan.active_mode} score={round(float(plan.score_total),2)}"
+            )
+            await self.telegram.enqueue('signal', body)
+
+    async def _notify_periodic_status(self) -> None:
+        if not self.telegram.should_send_status():
+            return
+        snapshot = self.status()
+        risk = snapshot.get('risk') or {}
+        gov = snapshot.get('safety', {}).get('governor_last') or {}
+        mode = 'REPLAY' if self.mode == 'replay' else 'LIVE'
+        body = (
+            f"[{mode}] {self.replay_symbol} {self.active_profile}\n"
+            f"equity={risk.get('monthly_progress_pct')}% dd={risk.get('global_drawdown_pct')}% realized/day={self.daily_state.get('daily_realized_pnl')}\n"
+            f"gov={gov.get('eligible')} kill={snapshot.get('safety', {}).get('kill_mode')}"
+        )
+        await self.telegram.enqueue('risk', body)
 
     async def _trip_kill_switch(self, mode: KillSwitchMode, reason: str, evidence: dict | None = None) -> dict:
         tripped, effective_mode = self.safety.trip(mode=mode.value, reason=reason, evidence=evidence or {})

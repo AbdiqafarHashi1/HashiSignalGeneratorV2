@@ -172,12 +172,12 @@ export const normalizeDatasets = (res: any): any[] => {
 };
 
 export const apiBaseUrl = baseURL;
-export const fetchOverview = async (timeoutMs?: number) => get("/overview", { _ts: Date.now() }, { timeoutMs });
-export const fetchTrades = async (limit = 500, offset = 0, timeoutMs?: number) => {
+export const fetchOverview = async (timeoutMs = 5000) => get("/overview", { _ts: Date.now() }, { timeoutMs });
+export const fetchTrades = async (limit = 500, offset = 0, timeoutMs = 5000) => {
   const raw = await get("/trades", { limit, offset, _ts: Date.now() }, { timeoutMs });
   return normalizeTrades(raw);
 };
-export const fetchPositions = async (timeoutMs?: number) => {
+export const fetchPositions = async (timeoutMs = 5000) => {
   const raw = await get("/positions", { _ts: Date.now() }, { timeoutMs });
   return normalizePositions(raw);
 };
@@ -187,7 +187,7 @@ export const fetchDatasets = async () => {
   const raw = await get("/replay/datasets");
   return normalizeDatasets(raw);
 };
-export const fetchEvents = async (limit = 500, offset = 0, timeoutMs?: number) => {
+export const fetchEvents = async (limit = 500, offset = 0, timeoutMs = 5000) => {
   const raw = await get("/events", { limit, offset, _ts: Date.now() }, { timeoutMs });
   return normalizeEvents(raw);
 };

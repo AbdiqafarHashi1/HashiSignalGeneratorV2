@@ -267,6 +267,8 @@ export default function Page() {
   const [lastRefreshAt, setLastRefreshAt] = useState<number | null>(null);
   const [uiNowMs, setUiNowMs] = useState<number>(Date.now());
   const [pollTick, setPollTick] = useState<number>(0);
+  const [overviewBackoffMs, setOverviewBackoffMs] = useState<number>(500);
+  const [controlBusy, setControlBusy] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [tradesRawShape, setTradesRawShape] = useState<string>("-");
   const [eventsRawShape, setEventsRawShape] = useState<string>("-");
@@ -281,6 +283,7 @@ export default function Page() {
   });
   const fileRef = useRef<HTMLInputElement | null>(null);
   const overviewReqSeq = useRef(0);
+  const overviewInFlight = useRef(false);
   const streamsReqSeq = useRef(0);
   const isRunningRef = useRef(false);
   const tradesRef = useRef<any[]>([]);
@@ -320,22 +323,27 @@ export default function Page() {
   }, []);
 
   const loadOverview = useCallback(async () => {
+    if (overviewInFlight.current || controlBusy) return;
+    overviewInFlight.current = true;
     const reqId = ++overviewReqSeq.current;
     const startedAt = Date.now();
     try {
-      const res = await fetchOverview(1200);
+      const res = await fetchOverview(5000);
       if (reqId !== overviewReqSeq.current) return;
       setOverview(res || {});
+      setOverviewBackoffMs(500);
       markFetchMeta('overview', { lastOkAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastCount: null, lastErr: null });
-      setError('');
       setLastRefreshAt(Date.now());
       setPollTick((t) => t + 1);
     } catch (e: any) {
       markFetchMeta('overview', { lastErrAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastErr: errorText(e) });
-      setError(errorText(e));
+      setOverviewBackoffMs((v) => Math.min(5000, v < 500 ? 500 : v * 2));
+      if (Date.now() - (fetchMeta.overview.lastOkAt || 0) > 15000) setError(errorText(e));
       setPollTick((t) => t + 1);
+    } finally {
+      overviewInFlight.current = false;
     }
-  }, [markFetchMeta]);
+  }, [controlBusy, fetchMeta.overview.lastOkAt, markFetchMeta]);
 
   const loadStreams = useCallback(async () => {
     const reqId = ++streamsReqSeq.current;
@@ -444,8 +452,24 @@ export default function Page() {
     void loadDatasets();
   }, [loadDatasets]);
 
-  usePollingLoop(() => loadOverview(), () => (isRunningRef.current ? 750 : 3000));
+  usePollingLoop(() => loadOverview(), () => (controlBusy ? 200 : (isRunningRef.current ? Math.max(500, overviewBackoffMs) : Math.max(1000, overviewBackoffMs))));
   usePollingLoop(() => loadStreams(), () => (isRunningRef.current ? 1200 : 3500));
+
+
+  const runControl = useCallback(async (action: () => Promise<any>) => {
+    if (controlBusy) return;
+    setControlBusy(true);
+    try {
+      await action();
+      await loadOverview();
+      await loadStreams();
+      setError('');
+    } catch (e: any) {
+      setError(errorText(e));
+    } finally {
+      setControlBusy(false);
+    }
+  }, [controlBusy, loadOverview, loadStreams]);
 
   useEffect(() => {
     if (!toast) return;
@@ -453,7 +477,7 @@ export default function Page() {
     return () => clearTimeout(timer);
   }, [toast]);
 
-  const canStart = Boolean(selectedDatasetId);
+  const canStart = Boolean(selectedDatasetId || DEFAULT_REPLAY_DATASET);
   const profile = String(overview?.active_profile || PROFILE_OPTIONS[0]).toUpperCase();
   const clock = overview?.replay?.candle_ts;
   const pointer = Number(overview?.replay?.pointer || 0);
@@ -463,7 +487,7 @@ export default function Page() {
   const preTradeAllowed = overview?.pre_trade_decision?.allowed !== false;
   const preTradeReason = text(overview?.pre_trade_decision?.reasonCode);
   const reconOk = overview?.safety?.reconciler?.ok !== false;
-  const reconCycles = Number(overview?.safety?.reconciler?.mismatch_cycles || 0);
+  const reconCycles = Number(overview?.safety?.reconciler?.mismatch_rate_10s ?? overview?.safety?.reconciler?.mismatch_cycles || 0);
   const reconStaleMs = overview?.safety?.staleness_ms;
   const dayKey = text(overview?.day?.day_key);
   const rolloverInEffect = Boolean(overview?.day?.rollover_in_effect);
@@ -665,12 +689,12 @@ export default function Page() {
               </div>
 
               <div className='flex flex-wrap items-center gap-3'>
-                <button className='h-9 rounded border border-cyan-700 bg-cyan-950/30 px-3 text-sm text-cyan-200 disabled:opacity-50 disabled:cursor-not-allowed' disabled={!canStart} title={canStart ? '' : 'Select or upload a dataset first'} onClick={() => replayStart({ dataset_id: selectedDatasetId, speed: Math.max(1, Math.round(speed)) }).then(loadOverview).then(loadStreams).catch((e) => setError(errorText(e)))}>Start</button>
-                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => replayPause().then(loadOverview).catch((e) => setError(errorText(e)))}>Pause</button>
-                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => replayResume().then(loadOverview).catch((e) => setError(errorText(e)))}>Resume</button>
-                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => replayStep().then(loadOverview).then(loadStreams).catch((e) => setError(errorText(e)))}>Step</button>
-                <button className='h-9 rounded border border-rose-700 bg-rose-950/30 px-3 text-sm text-rose-200' onClick={() => replayStop().then(loadOverview).catch((e) => setError(errorText(e)))}>Stop</button>
-                <button className='h-9 rounded border border-rose-800 bg-rose-950/20 px-3 text-sm text-rose-100' onClick={() => replayReset().then(loadOverview).then(loadStreams).catch((e) => setError(errorText(e)))}>Reset</button>
+                <button className='h-9 rounded border border-cyan-700 bg-cyan-950/30 px-3 text-sm text-cyan-200 disabled:opacity-50 disabled:cursor-not-allowed' disabled={!canStart || controlBusy} title={canStart ? '' : 'Select or upload a dataset first'} onClick={() => runControl(() => replayStart({ dataset_id: selectedDatasetId || undefined, csv_path: DEFAULT_REPLAY_DATASET, speed: Math.max(1, Math.round(speed)) }))}>Start</button>
+                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => runControl(() => replayPause())} disabled={controlBusy}>Pause</button>
+                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => runControl(() => replayResume())} disabled={controlBusy}>Resume</button>
+                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => runControl(() => replayStep())} disabled={controlBusy}>Step</button>
+                <button className='h-9 rounded border border-rose-700 bg-rose-950/30 px-3 text-sm text-rose-200' onClick={() => runControl(() => replayStop())} disabled={controlBusy}>Stop</button>
+                <button className='h-9 rounded border border-rose-800 bg-rose-950/20 px-3 text-sm text-rose-100' onClick={() => runControl(() => replayReset())} disabled={controlBusy}>Reset</button>
                 <div className='flex h-9 items-center gap-2 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm'>
                   <span>Speed</span>
                   <input type='range' min='1' max='10' value={Math.round(speed)} onChange={(e) => setSpeed(Number(e.target.value) || 1)} />
@@ -813,7 +837,7 @@ export default function Page() {
             <div className={`inline-flex rounded border px-2 py-0.5 ${reconOk ? 'border-emerald-700 bg-emerald-950/30 text-emerald-300' : 'border-amber-700 bg-amber-950/30 text-amber-200'}`}>
               {reconOk ? 'OK' : 'MISMATCH'}
             </div>
-            <div>Mismatch count: {text(reconCycles)}</div>
+            <div>Mismatch 10s: {text(reconCycles)}</div>
             <div>Staleness: {text(reconStaleMs)} ms</div>
           </div>
         <div className='rounded border border-zinc-800 bg-zinc-900/60 p-3 space-y-1'>
