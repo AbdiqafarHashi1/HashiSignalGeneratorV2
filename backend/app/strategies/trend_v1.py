@@ -42,6 +42,9 @@ class TradePlan:
     base_qty: float
     size_mult: float
     final_qty: float
+    router_selected_strategy: str
+    router_reason: str
+    router_reason_tags: list[str]
 
 
 class TrendPullbackStrategyV1:
@@ -254,6 +257,9 @@ class TrendPullbackStrategyV1:
             base_qty=float(settings.replay_order_qty),
             size_mult=1.0,
             final_qty=float(settings.replay_order_qty),
+            router_selected_strategy='trend',
+            router_reason='baseline',
+            router_reason_tags=['baseline_mode'],
         )
         if len(candles) < max(settings.ema_slow + 5, settings.atr_len + 5):
             return default_plan
@@ -370,6 +376,9 @@ class TrendPullbackStrategyV1:
                 base_qty=float(settings.replay_order_qty),
                 size_mult=1.0,
                 final_qty=float(settings.replay_order_qty),
+                router_selected_strategy='trend',
+                router_reason='baseline',
+                router_reason_tags=['baseline_mode'],
             )
 
         entry_price = current_close
@@ -419,6 +428,9 @@ class TrendPullbackStrategyV1:
             base_qty=float(settings.replay_order_qty),
             size_mult=1.0,
             final_qty=float(settings.replay_order_qty),
+            router_selected_strategy='trend',
+            router_reason='baseline',
+            router_reason_tags=['baseline_mode'],
         )
 
     def build_plan(self, candles: list[dict], timeframe: str | None, pointer_index: int | None = None) -> TradePlan:
@@ -433,7 +445,14 @@ class TrendPullbackStrategyV1:
         atr_pct = float(gate_metrics.get('atr_pct') or ((atr / max(abs(current_close), 1e-12)) * 100.0))
         adx_or_chop = gate_metrics.get('chop_ratio') if gate_metrics.get('adx') is None else gate_metrics.get('adx')
         chop_ratio = float(gate_metrics.get('chop_ratio')) if gate_metrics.get('chop_ratio') is not None else None
-        strong_trend = bool(base_plan.regime_gate_ok and base_plan.regime_state == 'TREND_OK')
+        trend_strength = float(gate_metrics.get('trend_strength') or 0.0)
+        adx = float(gate_metrics.get('adx') or 0.0)
+        direction = str(base_plan.regime_direction or 'NEUTRAL').upper()
+        strong_trend = bool(
+            trend_strength >= float(settings.regime_trend_min)
+            and adx >= float(settings.adx_min)
+            and direction in {'BULL', 'BEAR'}
+        )
         chop = (float(gate_metrics.get('adx') or 0) < settings.adx_min) if gate_metrics.get('adx') is not None else (chop_ratio is not None and chop_ratio < settings.chop_min_ratio)
 
         breakout = detect_breakout_signal(candles, atr, self._last_breakout_index.get('default'), pointer_index)
@@ -442,22 +461,32 @@ class TrendPullbackStrategyV1:
             breakout.breakout_recent = True
 
         mode_reasons: list[str] = []
+        router_reason_tags: list[str] = []
         active_mode = 'BASELINE_TREND'
         if settings.feature_breakout and breakout.compression:
             active_mode = 'BREAKOUT_ONLY'
             mode_reasons.append('compression')
+            router_reason_tags.append('compression_breakout')
         elif strong_trend:
             active_mode = 'TREND_PULLBACK'
             mode_reasons.append('strong_trend')
+            router_reason_tags.append('forced_strong_trend')
             if settings.feature_breakout and breakout.breakout_recent:
                 mode_reasons.append('recent_breakout_override')
+                router_reason_tags.append('recent_breakout_override')
         elif chop:
             active_mode = 'STAND_DOWN'
             mode_reasons.append('chop')
+            router_reason_tags.append('fallback_hold')
+        else:
+            router_reason_tags.append('fallback_hold')
 
         plan = base_plan
         plan.active_mode = active_mode
         plan.mode_reasons = mode_reasons or ['baseline_mode']
+        plan.router_selected_strategy = 'breakout' if active_mode == 'BREAKOUT_ONLY' else ('pb2' if strong_trend else 'trend')
+        plan.router_reason_tags = list(dict.fromkeys(router_reason_tags or ['fallback_hold']))
+        plan.router_reason = plan.router_reason_tags[0]
         plan.breakout_box_high = breakout.box_high
         plan.breakout_box_low = breakout.box_low
         plan.breakout_compression = breakout.compression
@@ -467,6 +496,7 @@ class TrendPullbackStrategyV1:
             plan.decision = 'hold'
             plan.side = None
             plan.reasons = list(dict.fromkeys(plan.reasons + ['router_stand_down']))
+            plan.router_selected_strategy = 'none'
 
         if settings.feature_breakout and active_mode == 'BREAKOUT_ONLY':
             if breakout.side and breakout.entry_price and breakout.stop_price and breakout.tp1_price and breakout.tp2_price:
@@ -479,12 +509,13 @@ class TrendPullbackStrategyV1:
                 plan.strategy_name = f'{self.name}_breakout'
                 plan.setup_name = 'breakout_compression'
                 plan.reasons = list(dict.fromkeys(plan.reasons + breakout.mode_reasons + ['breakout_route']))
+                plan.router_reason = 'compression_breakout'
             else:
                 plan.decision = 'hold'
                 plan.side = None
                 plan.reasons = list(dict.fromkeys(plan.reasons + breakout.blockers + ['breakout_no_trigger']))
 
-        if settings.feature_pullback_v2 and active_mode == 'TREND_PULLBACK' and plan.side in ('BUY', 'SELL'):
+        if active_mode == 'TREND_PULLBACK' and plan.side in ('BUY', 'SELL'):
             pb2_ok, pb2_reasons = self._pullback_v2_check(candles, plan.side, atr, self._ema([float(c['close']) for c in candles[-(settings.ema_slow + 50) :]], settings.ema_fast))
             plan.pullback_v2_ok = pb2_ok
             plan.pullback_v2_reasons = pb2_reasons
@@ -494,6 +525,10 @@ class TrendPullbackStrategyV1:
                 plan.reasons = list(dict.fromkeys(plan.reasons + pb2_reasons))
             else:
                 plan.reasons = list(dict.fromkeys(plan.reasons + pb2_reasons))
+            plan.router_selected_strategy = 'pb2'
+            plan.router_reason = 'forced_strong_trend'
+            if not settings.feature_pullback_v2:
+                plan.reasons = list(dict.fromkeys(plan.reasons + ['pb2_feature_off_but_forced_eval']))
         else:
             plan.pullback_v2_ok = None
             plan.pullback_v2_reasons = []

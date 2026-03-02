@@ -10,6 +10,7 @@ import {
   fetchDatasets,
   fetchEvents,
   fetchOverview,
+  fetchReplayObservability,
   fetchPositions,
   fetchTrades,
   replayPause,
@@ -27,7 +28,7 @@ const PROFILE_OPTIONS = ['TREND_STABLE', 'SCALPER_STABLE'] as const;
 const DEFAULT_REPLAY_DATASET =
   (process.env.NEXT_PUBLIC_REPLAY_DATASET_DEFAULT as string | undefined) ||
   'data/datasets/ETHUSDT_15m.csv';
-type EndpointKey = 'overview' | 'trades' | 'events' | 'positions';
+type EndpointKey = 'overview' | 'trades' | 'events' | 'positions' | 'observability';
 type FetchMeta = {
   lastOkAt: number | null;
   lastErrAt: number | null;
@@ -270,11 +271,13 @@ export default function Page() {
   const [tradesRawShape, setTradesRawShape] = useState<string>("-");
   const [eventsRawShape, setEventsRawShape] = useState<string>("-");
   const [positionsRawShape, setPositionsRawShape] = useState<string>("-");
+  const [observability, setObservability] = useState<any>(null);
   const [fetchMeta, setFetchMeta] = useState<Record<EndpointKey, FetchMeta>>({
     overview: { lastOkAt: null, lastErrAt: null, lastDurationMs: null, lastCount: null, lastErr: null },
     trades: { lastOkAt: null, lastErrAt: null, lastDurationMs: null, lastCount: null, lastErr: null },
     events: { lastOkAt: null, lastErrAt: null, lastDurationMs: null, lastCount: null, lastErr: null },
     positions: { lastOkAt: null, lastErrAt: null, lastDurationMs: null, lastCount: null, lastErr: null },
+    observability: { lastOkAt: null, lastErrAt: null, lastDurationMs: null, lastCount: null, lastErr: null },
   });
   const fileRef = useRef<HTMLInputElement | null>(null);
   const overviewReqSeq = useRef(0);
@@ -390,7 +393,21 @@ export default function Page() {
       }
     })();
 
-    await Promise.allSettled([tradesTask, eventsTask, positionsTask]);
+    const observabilityTask = (async () => {
+      const startedAt = Date.now();
+      try {
+        const payload = await fetchReplayObservability(500);
+        if (reqId !== streamsReqSeq.current) return;
+        setObservability(payload || null);
+        const lifecycleCount = Array.isArray(payload?.lifecycle_events) ? payload.lifecycle_events.length : 0;
+        markFetchMeta('observability', { lastOkAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastCount: lifecycleCount, lastErr: null });
+      } catch (e: any) {
+        hadError = true;
+        markFetchMeta('observability', { lastErrAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastErr: errorText(e) });
+      }
+    })();
+
+    await Promise.allSettled([tradesTask, eventsTask, positionsTask, observabilityTask]);
     if (reqId !== streamsReqSeq.current) return;
     if (!hadError) setError('');
     setLastRefreshAt(Date.now());
@@ -503,6 +520,18 @@ export default function Page() {
   const latestDecisionSnapshot = useMemo(
     () => latestDecisionEvent?.risk_state_snapshot || {},
     [latestDecisionEvent],
+  );
+  const lifecycleEvents = useMemo(() => (Array.isArray(observability?.lifecycle_events) ? observability.lifecycle_events : []), [observability]);
+  const currentTradeId = useMemo(() => {
+    const fromPosition = openTrade?.id || displayOpenTrade?.id;
+    if (fromPosition) return String(fromPosition);
+    const active = [...lifecycleEvents].reverse().find((e: any) => String(e?.position_state || '').toUpperCase() === 'OPEN' && e?.trade_id);
+    return active?.trade_id ? String(active.trade_id) : null;
+  }, [lifecycleEvents, openTrade, displayOpenTrade]);
+  const lastLifecycleEvent = lifecycleEvents.length ? lifecycleEvents[lifecycleEvents.length - 1] : null;
+  const currentTradeTimeline = useMemo(
+    () => lifecycleEvents.filter((e: any) => (currentTradeId ? String(e?.trade_id || '') === currentTradeId : false)).slice(-50),
+    [lifecycleEvents, currentTradeId],
   );
   const regimeGateOk = latestDecisionSnapshot?.regime_gate_ok ?? overview?.latest_decision?.regime_gate_ok ?? null;
   const regimeGateReasons: string[] =
@@ -886,6 +915,9 @@ export default function Page() {
             <div className='flex justify-between font-mono'><span>Final Action</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.final_action || overview?.latest_decision?.final_action)}</span></div>
             <div className='flex justify-between'><span>Entry Eligibility</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.entry_eligibility ?? overview?.latest_decision?.entry_eligibility)}</span></div>
             <div className='flex justify-between'><span>Router Strategy</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.router_selected_strategy || overview?.latest_decision?.router_selected_strategy)}</span></div>
+            <div className='flex justify-between'><span>Router Reason</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.router_reason || overview?.latest_decision?.router_reason)}</span></div>
+            <div className='flex justify-between'><span>Current trade_id</span><span className='font-mono'>{text(currentTradeId)}</span></div>
+            <div className='rounded border border-zinc-800 px-2 py-1'><span>Last lifecycle event: {text(lastLifecycleEvent?.event_type)} | {text(lastLifecycleEvent?.primary_reason)}</span></div>
             <div className='flex justify-between'><span>Trade Blocker (primary)</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.trade_blocker_primary || overview?.latest_decision?.trade_blocker_primary)}</span></div>
             <div className='rounded border border-zinc-800 px-2 py-1'><span>Trade Blockers: {Array.isArray(latestDecisionEvent?.risk_state_snapshot?.trade_blockers) && latestDecisionEvent.risk_state_snapshot.trade_blockers.length ? latestDecisionEvent.risk_state_snapshot.trade_blockers.join(', ') : Array.isArray(overview?.latest_decision?.trade_blockers) && overview.latest_decision.trade_blockers.length ? overview.latest_decision.trade_blockers.join(', ') : 'n/a'}</span></div>
             <div className='flex justify-between'><span>Score</span><span>{fmtNum(latestDecisionEvent?.risk_state_snapshot?.score_total ?? overview?.latest_decision?.score, 2)}</span></div>
@@ -904,6 +936,7 @@ export default function Page() {
             <div className='h-1.5 rounded bg-zinc-800 overflow-hidden'><div className='h-1.5 bg-zinc-500' style={{ width: `${Math.max(0, Math.min(100, Number(latestDecisionEvent?.risk_state_snapshot?.score_total ?? overview?.latest_decision?.score ?? 0)))}%` }} /></div>
             <div className='space-y-1'><div className='text-zinc-400'>Components</div>{latestDecisionEvent?.risk_state_snapshot?.score_components ? Object.entries(latestDecisionEvent.risk_state_snapshot.score_components).map(([k, v]) => <div key={k} className='flex justify-between rounded border border-zinc-800 px-2 py-1'><span>{k}</span><span>{fmtNum(v, 3)}</span></div>) : <div className='text-zinc-500'>No component payload</div>}</div>
             <div className='space-y-1'><div className='text-zinc-400'>Reasons</div>{(latestDecisionEvent?.risk_state_snapshot?.reasons || []).length ? (latestDecisionEvent.risk_state_snapshot.reasons as string[]).map((r, i) => <div key={`${r}-${i}`} className='rounded border border-zinc-800 px-2 py-1 font-mono'>{r}</div>) : <div className='text-zinc-500'>No reasons payload</div>}</div>
+            <div className='space-y-1'><div className='text-zinc-400'>Trade Timeline (last 50 current trade)</div>{currentTradeTimeline.length ? <div className='max-h-44 overflow-y-auto space-y-1'>{currentTradeTimeline.map((evt: any, i: number) => <div key={`${evt?.timestamp}-${i}`} className='rounded border border-zinc-800 px-2 py-1 font-mono'>{text(evt?.event_type)} | {text(evt?.primary_reason)} | qty {fmtNum(evt?.current_qty, 4)} | mark {fmtNum(evt?.mark_price, 2)}</div>)}</div> : <div className='text-zinc-500'>No lifecycle events for current trade</div>}</div>
             {!overview?.governor?.eligible && <div className='space-y-1'>{(overview?.governor?.blockers || []).slice(0, 3).map((b: any, i: number) => <div key={`${b?.name}-${i}`} className='rounded border border-rose-800 bg-rose-950/30 px-2 py-1'>{text(b?.name)} | threshold {text(b?.threshold)} | current {text(b?.current)}</div>)}</div>}
           </div>
         </div>

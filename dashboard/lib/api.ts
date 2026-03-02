@@ -215,3 +215,5 @@ export const safetyTrip = async (mode: "soft" | "hard", reason?: string) =>
 export const fetchSafetyIncidents = async () => get("/api/safety/incidents", { _ts: Date.now() });
 export const fetchSafetyIncident = async (incidentId: string) =>
   get(`/api/safety/incidents/${encodeURIComponent(incidentId)}`, { _ts: Date.now() });
+
+export const fetchReplayObservability = async (n = 200) => get("/replay/observability", { n, _ts: Date.now() });

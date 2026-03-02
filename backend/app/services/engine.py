@@ -72,6 +72,7 @@ class EngineService:
             'daily_trade_count': 0,
         }
         self._decision_traces = deque(maxlen=max(10, int(settings.decision_trace_ring_size)))
+        self._lifecycle_events = deque(maxlen=max(20, int(settings.lifecycle_event_ring_size)))
         self._trace_summary: dict[str, object] = {
             'total_bars': 0,
             'regime_pass': 0,
@@ -83,6 +84,8 @@ class EngineService:
             'governor_blockers': Counter(),
             'score_ge_min_no_trade': Counter(),
             'entry_bars': [],
+            'entry_blockers_when_regime_pass': Counter(),
+            'manage_reasons': Counter(),
         }
 
     async def start(self, mode: str = 'live') -> dict:
@@ -162,7 +165,10 @@ class EngineService:
             'governor_blockers': Counter(),
             'score_ge_min_no_trade': Counter(),
             'entry_bars': [],
+            'entry_blockers_when_regime_pass': Counter(),
+            'manage_reasons': Counter(),
         }
+        self._lifecycle_events.clear()
         await self.replay.start()
         return await self.start(mode='replay')
 
@@ -174,6 +180,7 @@ class EngineService:
         self._tp1_done_by_trade.clear()
         self._history_by_symbol.clear()
         self._decision_traces.clear()
+        self._print_lifecycle_diagnostics()
         return await self.stop()
 
     async def pause_replay(self) -> dict:
@@ -345,7 +352,7 @@ class EngineService:
             final_action = 'HOLD'
             if position and trade:
                 position.unrealized_pnl = self._calc_unrealized(position=position, mark_price=price_close)
-                final_action = await self._evaluate_open_trade(
+                final_action, manage_reason, manage_tags = await self._evaluate_open_trade(
                     db=db,
                     trade=trade,
                     position=position,
@@ -358,6 +365,17 @@ class EngineService:
                     plan=plan,
                 )
                 decision = 'hold'
+                await self._record_lifecycle_event(
+                    event_type='POSITION_MANAGE_TICK',
+                    timestamp=ts_ms,
+                    symbol=symbol,
+                    trade=trade,
+                    position=position,
+                    action=final_action,
+                    primary_reason=manage_reason,
+                    reason_tags=manage_tags,
+                    mark_price=price_close,
+                )
             elif plan.side in ('BUY', 'SELL') and self.risk.can_trade():
                 allowed_guard, guard_reason = self.safety.execution_guard(action='entry', reduce_only=False)
                 if not allowed_guard:
@@ -377,6 +395,18 @@ class EngineService:
                         'reasonDetail': 'Entry blocked by kill switch',
                         'metrics': self._pretrade_metrics_from_governor(None),
                     }
+                    await self._record_lifecycle_event(
+                        event_type='ORDER_REJECTED',
+                        timestamp=ts_ms,
+                        symbol=symbol,
+                        trade=None,
+                        position=position,
+                        action='ENTRY_BLOCKED',
+                        primary_reason='kill_switch',
+                        reason_tags=[str(guard_reason or 'kill_switch')],
+                        mark_price=price_close,
+                        entry_qty=Decimal(str(plan.qty)),
+                    )
                     await self._emit_blocked_event(
                         db=db,
                         ts_ms=ts_ms,
@@ -432,6 +462,18 @@ class EngineService:
                     decision = 'BLOCKED'
                     blockers = gov['blockers']
                     final_action = 'HOLD'
+                    await self._record_lifecycle_event(
+                        event_type='ORDER_REJECTED',
+                        timestamp=ts_ms,
+                        symbol=symbol,
+                        trade=None,
+                        position=position,
+                        action='ENTRY_BLOCKED',
+                        primary_reason='governor_block',
+                        reason_tags=[str(b.get('name')) for b in (gov.get('blockers') or []) if isinstance(b, dict) and b.get('name')],
+                        mark_price=price_close,
+                        entry_qty=Decimal(str(plan.qty)),
+                    )
                     await self._emit_blocked_event(
                         db=db,
                         ts_ms=ts_ms,
@@ -460,6 +502,8 @@ class EngineService:
                 blockers=blocker_list,
                 primary_blocker=primary_blocker,
                 position_open=bool(position and trade),
+                router_reason=str(getattr(plan, 'router_reason', 'fallback_hold')),
+                router_selected_strategy=str(getattr(plan, 'router_selected_strategy', 'none')),
             )
             self._record_decision_trace(trace)
 
@@ -565,6 +609,42 @@ class EngineService:
         self._open_bar_by_symbol[symbol] = replay_clock
         self._tp1_done_by_trade[trade.id] = False
         self.daily_state['daily_trade_count'] = int(self.daily_state.get('daily_trade_count', 0)) + 1
+        await self._record_lifecycle_event(
+            event_type='ORDER_CREATED',
+            timestamp=entry_ts_ms,
+            symbol=symbol,
+            trade=trade,
+            position=position,
+            action='ENTRY',
+            primary_reason='order_created',
+            reason_tags=['router_entry_signal'],
+            mark_price=entry_price,
+            entry_qty=qty,
+        )
+        await self._record_lifecycle_event(
+            event_type='ORDER_ACCEPTED',
+            timestamp=entry_ts_ms,
+            symbol=symbol,
+            trade=trade,
+            position=position,
+            action='ENTRY',
+            primary_reason='order_accepted',
+            reason_tags=['replay_fill_assumed'],
+            mark_price=entry_price,
+            entry_qty=qty,
+        )
+        await self._record_lifecycle_event(
+            event_type='POSITION_OPENED',
+            timestamp=entry_ts_ms,
+            symbol=symbol,
+            trade=trade,
+            position=position,
+            action='OPEN',
+            primary_reason='entry_fill',
+            reason_tags=['position_open'],
+            mark_price=entry_price,
+            entry_qty=qty,
+        )
         await self._emit_trade_event(
             db=db,
             ts_ms=entry_ts_ms,
@@ -614,7 +694,7 @@ class EngineService:
         ts_dt: datetime,
         replay_clock: int,
         plan: TradePlan,
-    ) -> str:
+    ) -> tuple[str, str, list[str]]:
         stop = Decimal(str(trade.stop_price or 0))
         tp1 = Decimal(str(trade.tp1_price or 0))
         tp2 = Decimal(str(trade.tp2_price or 0))
@@ -646,7 +726,7 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
-            return 'EXIT'
+            return 'EXIT', 'sl_close', ['stop_loss_hit']
 
         if tp2_hit:
             if not tp1_done and tp1 > 0:
@@ -672,7 +752,7 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
-            return 'EXIT'
+            return 'EXIT', 'tp_close', ['tp2_hit']
 
         if tp1_hit and not tp1_done:
             await self._partial_close(
@@ -685,7 +765,7 @@ class EngineService:
                 portion=settings.partial_pct,
             )
             self._tp1_done_by_trade[trade.id] = True
-            return 'PARTIAL'
+            return 'PARTIAL', 'tp1_close', ['tp1_hit']
 
         if bars_held >= time_stop_limit:
             await self._final_close(
@@ -699,7 +779,7 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
-            return 'EXIT'
+            return 'EXIT', 'time_close', ['time_stop']
 
         opposite = (trade.side == 'BUY' and plan.side == 'SELL') or (trade.side == 'SELL' and plan.side == 'BUY')
         if opposite and plan.score_total >= settings.score_min:
@@ -714,8 +794,8 @@ class EngineService:
                 symbol=trade.symbol,
                 replay_clock=replay_clock,
             )
-            return 'EXIT'
-        return 'HOLD'
+            return 'EXIT', 'signal_close', ['opposite_signal']
+        return 'HOLD', 'manage_hold', ['hold_no_exit_trigger']
 
     def _build_blockers(self, *, plan: TradePlan, blockers: list[dict], position_open: bool, decision: str) -> list[str]:
         blocker_set = set(str(b.get('name')) for b in blockers if isinstance(b, dict) and b.get('name'))
@@ -732,18 +812,18 @@ class EngineService:
             blocker_set.add('governor_block')
         if plan.qty <= 0:
             blocker_set.add('qty_invalid')
-        if not blocker_set and plan.decision == 'hold':
+        if not blocker_set and plan.decision == 'hold' and str(getattr(plan, 'router_reason', '')) != 'forced_strong_trend':
             blocker_set.add('router_hold')
         return sorted(blocker_set)
 
     def _router_status(self, plan: TradePlan) -> tuple[str, str]:
-        selected = 'none'
+        selected = str(getattr(plan, 'router_selected_strategy', 'none') or 'none')
+        reason = str(getattr(plan, 'router_reason', 'fallback_hold') or 'fallback_hold')
         if plan.active_mode == 'STAND_DOWN':
             return 'stand_down', selected
         if plan.decision in ('enter_long', 'enter_short'):
-            selected = 'breakout' if 'breakout' in str(plan.strategy_name) else ('pb2' if plan.pullback_v2_ok else 'trend')
             return f'select_{selected}', selected
-        return 'hold', selected
+        return reason, selected
 
     def _build_decision_trace(
         self,
@@ -757,8 +837,11 @@ class EngineService:
         blockers: list[str],
         primary_blocker: str | None,
         position_open: bool,
+        router_reason: str,
+        router_selected_strategy: str,
     ) -> dict:
         router_status, selected = self._router_status(plan)
+        selected = router_selected_strategy or selected
         setup_confirmed = bool(plan.side in ('BUY', 'SELL') and plan.decision in ('enter_long', 'enter_short'))
         evaluated = [
             {'strategy': 'trend', 'evaluated': True, 'reason': 'baseline'},
@@ -777,6 +860,7 @@ class EngineService:
                 'evaluated': evaluated,
                 'selected': selected,
                 'decision_status': router_status,
+                'reason': router_reason,
             },
             'regime_gate': {
                 'pass': bool(plan.regime_gate_ok),
@@ -830,6 +914,11 @@ class EngineService:
         if isinstance(blockers_counter, Counter):
             for blocker in trace.get('trade_blockers') or []:
                 blockers_counter[str(blocker)] += 1
+        if trace.get('regime_gate', {}).get('pass') and trace.get('final_action') != 'ENTER':
+            pass_blockers = summary.get('entry_blockers_when_regime_pass')
+            if isinstance(pass_blockers, Counter):
+                for blocker in trace.get('trade_blockers') or ['none']:
+                    pass_blockers[str(blocker)] += 1
         gov_counter = summary['governor_blockers']
         if isinstance(gov_counter, Counter) and 'governor_block' in (trace.get('trade_blockers') or []):
             for blocker in trace.get('trade_blockers') or []:
@@ -851,7 +940,10 @@ class EngineService:
         blockers = summary['blockers'] if isinstance(summary.get('blockers'), Counter) else Counter()
         score_ge = summary['score_ge_min_no_trade'] if isinstance(summary.get('score_ge_min_no_trade'), Counter) else Counter()
         gov = summary['governor_blockers'] if isinstance(summary.get('governor_blockers'), Counter) else Counter()
+        manage = summary['manage_reasons'] if isinstance(summary.get('manage_reasons'), Counter) else Counter()
+        pass_blockers = summary['entry_blockers_when_regime_pass'] if isinstance(summary.get('entry_blockers_when_regime_pass'), Counter) else Counter()
         no_trade = self._diagnose_no_trade_streak()
+        lifecycle_events = list(self._lifecycle_events)[-max(1, int(last_n)) :]
         return {
             'replay': self.replay_status(),
             'decision_traces': traces,
@@ -868,9 +960,101 @@ class EngineService:
                 ],
                 'governor_blocks': dict(gov),
                 'score_ge_min_no_trade': dict(score_ge),
+                'entry_blockers_when_regime_pass': dict(pass_blockers),
             },
+            'lifecycle_events': lifecycle_events,
+            'lifecycle_summary': self._build_lifecycle_summary(),
+            'manage_reasons_ranked': [{'reason': k, 'count': v} for k, v in manage.most_common(10)],
             'no_trade_streak': no_trade,
         }
+
+
+    def _build_lifecycle_summary(self) -> dict:
+        events = list(self._lifecycle_events)
+        opened = [e for e in events if e.get('event_type') == 'POSITION_OPENED']
+        closed = [e for e in events if e.get('event_type') == 'POSITION_CLOSED']
+        holding_seconds: list[float] = []
+        opened_by_trade = {str(e.get('trade_id')): e for e in opened if e.get('trade_id')}
+        for close in closed:
+            key = str(close.get('trade_id'))
+            if key in opened_by_trade:
+                try:
+                    holding_seconds.append(max(0.0, (float(close.get('timestamp') or 0) - float(opened_by_trade[key].get('timestamp') or 0)) / 1000.0))
+                except Exception:
+                    continue
+        exit_reasons = Counter(str(e.get('primary_reason') or 'unknown') for e in closed)
+        manage_reasons = Counter(str(e.get('primary_reason') or 'unknown') for e in events if e.get('event_type') == 'POSITION_MANAGE_TICK')
+        return {
+            'trades_count': len(opened),
+            'avg_holding_seconds': (sum(holding_seconds) / len(holding_seconds)) if holding_seconds else 0.0,
+            'mae': None,
+            'mfe': None,
+            'top_exit_reasons': [{'reason': k, 'count': v} for k, v in exit_reasons.most_common(10)],
+            'top_manage_reasons': [{'reason': k, 'count': v} for k, v in manage_reasons.most_common(10)],
+        }
+
+    def _print_lifecycle_diagnostics(self) -> None:
+        summary = self._build_lifecycle_summary()
+        pass_blockers = self._trace_summary.get('entry_blockers_when_regime_pass')
+        ranked_pass_blockers = []
+        if isinstance(pass_blockers, Counter):
+            ranked_pass_blockers = [{'reason': k, 'count': v} for k, v in pass_blockers.most_common(10)]
+        print('=== TRADE LIFECYCLE DIAGNOSTICS ===')
+        print({'trades_count': summary.get('trades_count'), 'avg_holding_seconds': summary.get('avg_holding_seconds'), 'mae': summary.get('mae'), 'mfe': summary.get('mfe')})
+        print('top_exit_reasons', summary.get('top_exit_reasons'))
+        print('top_manage_reasons', summary.get('top_manage_reasons'))
+        print('top_entry_blockers_when_regime_pass', ranked_pass_blockers)
+
+    async def _record_lifecycle_event(
+        self,
+        *,
+        event_type: str,
+        timestamp: int,
+        symbol: str,
+        trade: Trade | None,
+        position: Position | None,
+        action: str,
+        primary_reason: str,
+        reason_tags: list[str],
+        mark_price: Decimal,
+        entry_qty: Decimal | None = None,
+        closed_qty: Decimal | None = None,
+        exit_price: Decimal | None = None,
+    ) -> None:
+        entry_qty_val = float(entry_qty if entry_qty is not None else (trade.quantity if trade is not None else 0))
+        current_qty_val = float(position.quantity) if position is not None else 0.0
+        closed_qty_val = float(closed_qty) if closed_qty is not None else 0.0
+        mark = float(mark_price)
+        event = {
+            'timestamp': timestamp,
+            'symbol': symbol,
+            'trade_id': str(trade.id) if trade else None,
+            'position_state': 'OPEN' if (position is not None and bool(position.is_open)) else 'FLAT',
+            'event_type': event_type,
+            'action': action,
+            'primary_reason': primary_reason,
+            'reason_tags': list(reason_tags or []),
+            'entry_qty': entry_qty_val,
+            'current_qty': current_qty_val,
+            'closed_qty': closed_qty_val,
+            'entry_price': float(trade.entry_price) if trade is not None else None,
+            'mark_price': mark,
+            'stop_price': float(trade.stop_price) if trade is not None and trade.stop_price is not None else None,
+            'tp1_price': float(trade.tp1_price) if trade is not None and trade.tp1_price is not None else None,
+            'tp2_price': float(trade.tp2_price) if trade is not None and trade.tp2_price is not None else None,
+            'exit_price': float(exit_price) if exit_price is not None else None,
+            'unrealized_pnl': float(position.unrealized_pnl) if position is not None and position.unrealized_pnl is not None else 0.0,
+            'realized_pnl': float(trade.pnl_gross) if trade is not None and trade.pnl_gross is not None else 0.0,
+            'fees': float(trade.fees_total) if trade is not None and trade.fees_total is not None else 0.0,
+            'net_pnl': (float(trade.pnl_net) if trade is not None and trade.pnl_net is not None else 0.0),
+            'notional': float(trade.notional) if trade is not None and trade.notional is not None else abs(entry_qty_val * mark),
+            'r_multiple': None,
+        }
+        self._lifecycle_events.append(event)
+        if event_type == 'POSITION_MANAGE_TICK':
+            cast_manage = self._trace_summary.get('manage_reasons')
+            if isinstance(cast_manage, Counter):
+                cast_manage[str(primary_reason or 'unknown')] += 1
 
     def _diagnose_no_trade_streak(self) -> dict:
         traces = list(self._decision_traces)
@@ -992,6 +1176,19 @@ class EngineService:
         self.daily_state['daily_realized_pnl'] = float(self.daily_state.get('daily_realized_pnl', 0.0)) + float(gross_delta - fee_delta)
         self.daily_state['daily_fees'] = float(self.daily_state.get('daily_fees', 0.0)) + float(fee_delta)
 
+        await self._record_lifecycle_event(
+            event_type='PARTIAL_TP',
+            timestamp=close_ts_ms,
+            symbol=trade.symbol,
+            trade=trade,
+            position=position,
+            action='PARTIAL',
+            primary_reason=reason,
+            reason_tags=['partial_take_profit'],
+            mark_price=close_price,
+            closed_qty=close_qty,
+            exit_price=close_price,
+        )
         await self._emit_trade_event(
             db=db,
             ts_ms=close_ts_ms,
@@ -1079,6 +1276,32 @@ class EngineService:
         self._open_bar_by_symbol.pop(symbol, None)
         self._tp1_done_by_trade.pop(trade.id, None)
 
+        await self._record_lifecycle_event(
+            event_type='EXIT_SIGNALLED',
+            timestamp=exit_ts_ms,
+            symbol=symbol,
+            trade=trade,
+            position=position,
+            action='EXIT',
+            primary_reason=reason,
+            reason_tags=['exit_triggered'],
+            mark_price=exit_price,
+            exit_price=exit_price,
+            closed_qty=remaining_qty,
+        )
+        await self._record_lifecycle_event(
+            event_type='POSITION_CLOSED',
+            timestamp=exit_ts_ms,
+            symbol=symbol,
+            trade=trade,
+            position=position,
+            action='CLOSE',
+            primary_reason=reason,
+            reason_tags=['position_closed'],
+            mark_price=exit_price,
+            exit_price=exit_price,
+            closed_qty=remaining_qty,
+        )
         await self._emit_trade_event(
             db=db,
             ts_ms=exit_ts_ms,
@@ -1243,7 +1466,8 @@ class EngineService:
                     'blockers': dedup_blockers,
                     'final_action': 'STAND_DOWN' if plan.active_mode == 'STAND_DOWN' else ('SIGNAL_LONG' if plan.decision == 'enter_long' else ('SIGNAL_SHORT' if plan.decision == 'enter_short' else 'HOLD')),
                     'entry_eligibility': bool(plan.decision in ('enter_long', 'enter_short')),
-                    'router_selected_strategy': 'breakout' if 'breakout' in str(plan.strategy_name) else ('pb2' if plan.pullback_v2_ok else ('trend' if plan.decision in ('enter_long', 'enter_short') else 'none')),
+                    'router_selected_strategy': str(getattr(plan, 'router_selected_strategy', 'none')),
+                    'router_reason': str(getattr(plan, 'router_reason', 'fallback_hold')),
                     'trade_blocker_primary': dedup_blockers[0] if dedup_blockers else None,
                     'trade_blockers': dedup_blockers,
                 },

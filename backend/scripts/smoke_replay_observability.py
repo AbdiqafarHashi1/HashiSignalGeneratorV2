@@ -2,7 +2,7 @@
 """Replay smoke for observability diagnostics.
 
 Runs ~30 days from ETHUSDT_15m dataset (or full dataset when shorter), steps through replay,
-and prints decision-trace observability summaries.
+and prints decision + lifecycle observability summaries.
 """
 
 from __future__ import annotations
@@ -46,12 +46,14 @@ def main() -> None:
         obs = _get('/replay/observability', params={'n': 2000}).json()
         trades = _get('/trades', params={'limit': 2000, 'offset': 0}).json().get('items', [])
         counters = obs.get('blocker_counters', {})
+        lifecycle_summary = obs.get('lifecycle_summary', {})
+        lifecycle_events = obs.get('lifecycle_events', [])[-50:]
         top_blockers = counters.get('blockers_ranked', [])[:10]
         no_trade = obs.get('no_trade_streak', {})
 
         print('=== OBSERVABILITY SMOKE REPORT ===')
         print(f"dataset_id={dataset_id} steps={steps} rows_count={rows_count}")
-        print('summary', {
+        print('decision_summary', {
             'total_bars': counters.get('total_bars'),
             'regime_pass': counters.get('regime_pass'),
             'regime_fail': counters.get('regime_fail'),
@@ -60,8 +62,18 @@ def main() -> None:
             'router_selected': counters.get('router_selected'),
         })
         print('top_blockers', top_blockers)
+        print('top_entry_blockers_when_regime_pass', counters.get('entry_blockers_when_regime_pass', {}))
         print('trades_count', len(trades))
         print('longest_no_entry_streak', no_trade)
+        print('lifecycle_summary', {
+            'trades_count': lifecycle_summary.get('trades_count'),
+            'avg_holding_seconds': lifecycle_summary.get('avg_holding_seconds'),
+            'top_exit_reasons': lifecycle_summary.get('top_exit_reasons'),
+            'top_manage_reasons': lifecycle_summary.get('top_manage_reasons'),
+        })
+        print('last_50_lifecycle_events')
+        for evt in lifecycle_events:
+            print(evt)
     finally:
         _post('/replay/stop').raise_for_status()
 
