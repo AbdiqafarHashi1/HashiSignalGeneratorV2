@@ -487,7 +487,7 @@ export default function Page() {
   const preTradeAllowed = overview?.pre_trade_decision?.allowed !== false;
   const preTradeReason = text(overview?.pre_trade_decision?.reasonCode);
   const reconOk = overview?.safety?.reconciler?.ok !== false;
-  const reconCycles = Number(overview?.safety?.reconciler?.mismatch_rate_10s ?? overview?.safety?.reconciler?.mismatch_cycles || 0);
+  const reconCycles = Number((overview?.safety?.reconciler?.mismatch_rate_10s ?? overview?.safety?.reconciler?.mismatch_cycles) ?? 0);
   const reconStaleMs = overview?.safety?.staleness_ms;
   const dayKey = text(overview?.day?.day_key);
   const rolloverInEffect = Boolean(overview?.day?.rollover_in_effect);
