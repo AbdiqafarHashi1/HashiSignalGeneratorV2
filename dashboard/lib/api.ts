@@ -206,7 +206,7 @@ export const replayStep = async () => post("/replay/step");
 export const replayStop = async () => post("/replay/stop");
 export const replayReset = async () => post("/replay/reset");
 export const controlClosePosition = async (trade_id: string) => post("/control/close_position", { trade_id });
-export const controlSetProfile = async (profile: "TREND_STABLE" | "SCALPER_STABLE") =>
+export const controlSetProfile = async (profile: "TREND_STABLE" | "GROWTH_HUNTER" | "PROP_HUNTER") =>
   post("/control/set_profile", { profile });
 export const fetchSafetyStatus = async () => get("/api/safety/status", { _ts: Date.now() });
 export const safetyArm = async (mode: "off" | "soft" | "hard") => post("/api/safety/arm", { mode });

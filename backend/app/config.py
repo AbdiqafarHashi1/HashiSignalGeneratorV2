@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     gov_cooldown_minutes: int = 10
     gov_daily_lock_on_breach: bool = True
     strategy_profile: str = 'TREND_STABLE'
+    active_profile: str = 'TREND_STABLE'
     ema_fast: int = 20
     ema_slow: int = 50
     atr_len: int = 14

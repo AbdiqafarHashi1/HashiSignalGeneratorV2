@@ -12,6 +12,9 @@ class FakeRedis:
     async def set(self, key: str, value: str) -> None:
         self.storage[key] = value
 
+    async def get(self, key: str) -> str | None:
+        return self.storage.get(key)
+
 
 @pytest.mark.asyncio
 async def test_engine_boot_cleanly() -> None:
