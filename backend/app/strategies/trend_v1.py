@@ -45,6 +45,10 @@ class TradePlan:
     router_selected_strategy: str
     router_reason: str
     router_reason_tags: list[str]
+    risk_pct_used: float | None = None
+    stop_distance: float | None = None
+    target_price: float | None = None
+    r_multiple: float | None = None
 
 
 class TrendPullbackStrategyV1:
@@ -136,6 +140,171 @@ class TrendPullbackStrategyV1:
             if float(candles[j]['high']) >= target:
                 return False
         return True
+
+    def _htf_ema_slope(self, candles: list[dict], timeframe: str | None) -> float:
+        tf_minutes = self._timeframe_minutes(timeframe)
+        factor = max(2, int(round(240 / max(tf_minutes, 1))))
+        htf_candles = self._aggregate_htf(candles, factor)
+        if len(htf_candles) < max(4, settings.ema_fast + 2):
+            return 0.0
+        htf_closes = [float(c['close']) for c in htf_candles]
+        now = self._ema(htf_closes, settings.ema_fast)
+        prev = self._ema(htf_closes[:-1], settings.ema_fast)
+        return float(now - prev)
+
+    def _growth_structural_setup(
+        self,
+        candles: list[dict],
+        timeframe: str | None,
+        adx: float,
+        atr: float,
+        regime_state: str,
+        regime_direction: str,
+        gate_ok: bool,
+        gate_reasons: list[str],
+        gate_metrics: dict[str, float | None],
+    ) -> TradePlan | None:
+        if len(candles) < 80:
+            return None
+        pivot_len = max(2, int(settings.pb2_pivot_len))
+        window = 7
+        pivot_highs = [i for i in range(pivot_len, len(candles) - pivot_len) if self._pivot_high(candles, i, pivot_len)]
+        pivot_lows = [i for i in range(pivot_len, len(candles) - pivot_len) if self._pivot_low(candles, i, pivot_len)]
+        if len(pivot_highs) < window or len(pivot_lows) < window:
+            return None
+
+        htf_slope = self._htf_ema_slope(candles, timeframe)
+        adx_ok = adx > 18.0
+        current_close = float(candles[-1]['close'])
+        reasons: list[str] = []
+
+        recent_high_pivots = pivot_highs[-window:]
+        recent_low_pivots = pivot_lows[-window:]
+        broken_high_level = max(float(candles[i]['high']) for i in recent_high_pivots)
+        broken_low_level = min(float(candles[i]['low']) for i in recent_low_pivots)
+
+        break_high_idx = next((i for i in range(max(recent_high_pivots[-1] + 1, 1), len(candles) - 1) if float(candles[i]['close']) > broken_high_level), None)
+        break_low_idx = next((i for i in range(max(recent_low_pivots[-1] + 1, 1), len(candles) - 1) if float(candles[i]['close']) < broken_low_level), None)
+
+        if adx_ok and htf_slope > 0 and break_high_idx is not None:
+            retest_idx = next(
+                (
+                    i
+                    for i in range(break_high_idx + 1, len(candles) - 1)
+                    if float(candles[i]['low']) <= broken_high_level and float(candles[i]['close']) >= broken_high_level
+                ),
+                None,
+            )
+            if retest_idx is not None and current_close > float(candles[retest_idx]['high']):
+                stop_candidates = [float(candles[i]['low']) for i in pivot_lows if i < retest_idx]
+                if stop_candidates:
+                    stop_price = min(stop_candidates[-window:])
+                    stop_distance = max(1e-9, current_close - stop_price)
+                    target = current_close + (stop_distance * float(settings.growth_target_r))
+                    reasons.extend(['growth_break_swing_high', 'growth_retest_hold', 'growth_retest_break'])
+                    return TradePlan(
+                        decision='enter_long',
+                        side='BUY',
+                        regime=regime_state,
+                        score_total=100.0,
+                        score_components={'structure': 1.0, 'adx': 1.0, 'htf_slope': 1.0},
+                        reasons=reasons,
+                        entry_price=current_close,
+                        stop_price=stop_price,
+                        tp1_price=None,
+                        tp2_price=target,
+                        time_stop_bars=settings.time_stop_bars,
+                        setup_name='growth_structural_swing',
+                        strategy_name=f'{self.name}_growth_structural',
+                        leverage=settings.leverage,
+                        qty=settings.replay_order_qty,
+                        atr=atr,
+                        regime_state=regime_state,
+                        regime_direction=regime_direction,
+                        regime_gate_ok=gate_ok,
+                        regime_gate_reasons=gate_reasons,
+                        regime_gate_metrics=gate_metrics,
+                        blockers=[],
+                        active_mode='GROWTH_STRUCTURAL_SWING',
+                        mode_reasons=['growth_structural_mode'],
+                        breakout_box_high=broken_high_level,
+                        breakout_box_low=broken_low_level,
+                        breakout_compression=False,
+                        breakout_recent=False,
+                        pullback_v2_ok=None,
+                        pullback_v2_reasons=[],
+                        base_qty=float(settings.replay_order_qty),
+                        size_mult=1.0,
+                        final_qty=float(settings.replay_order_qty),
+                        router_selected_strategy='growth_structural',
+                        router_reason='growth_structural',
+                        router_reason_tags=['growth_structural'],
+                        risk_pct_used=float(settings.growth_risk_pct),
+                        stop_distance=stop_distance,
+                        target_price=target,
+                        r_multiple=float(settings.growth_target_r),
+                    )
+
+        if adx_ok and htf_slope < 0 and break_low_idx is not None:
+            retest_idx = next(
+                (
+                    i
+                    for i in range(break_low_idx + 1, len(candles) - 1)
+                    if float(candles[i]['high']) >= broken_low_level and float(candles[i]['close']) <= broken_low_level
+                ),
+                None,
+            )
+            if retest_idx is not None and current_close < float(candles[retest_idx]['low']):
+                stop_candidates = [float(candles[i]['high']) for i in pivot_highs if i < retest_idx]
+                if stop_candidates:
+                    stop_price = max(stop_candidates[-window:])
+                    stop_distance = max(1e-9, stop_price - current_close)
+                    target = current_close - (stop_distance * float(settings.growth_target_r))
+                    reasons.extend(['growth_break_swing_low', 'growth_retest_hold', 'growth_retest_break'])
+                    return TradePlan(
+                        decision='enter_short',
+                        side='SELL',
+                        regime=regime_state,
+                        score_total=100.0,
+                        score_components={'structure': 1.0, 'adx': 1.0, 'htf_slope': 1.0},
+                        reasons=reasons,
+                        entry_price=current_close,
+                        stop_price=stop_price,
+                        tp1_price=None,
+                        tp2_price=target,
+                        time_stop_bars=settings.time_stop_bars,
+                        setup_name='growth_structural_swing',
+                        strategy_name=f'{self.name}_growth_structural',
+                        leverage=settings.leverage,
+                        qty=settings.replay_order_qty,
+                        atr=atr,
+                        regime_state=regime_state,
+                        regime_direction=regime_direction,
+                        regime_gate_ok=gate_ok,
+                        regime_gate_reasons=gate_reasons,
+                        regime_gate_metrics=gate_metrics,
+                        blockers=[],
+                        active_mode='GROWTH_STRUCTURAL_SWING',
+                        mode_reasons=['growth_structural_mode'],
+                        breakout_box_high=broken_high_level,
+                        breakout_box_low=broken_low_level,
+                        breakout_compression=False,
+                        breakout_recent=False,
+                        pullback_v2_ok=None,
+                        pullback_v2_reasons=[],
+                        base_qty=float(settings.replay_order_qty),
+                        size_mult=1.0,
+                        final_qty=float(settings.replay_order_qty),
+                        router_selected_strategy='growth_structural',
+                        router_reason='growth_structural',
+                        router_reason_tags=['growth_structural'],
+                        risk_pct_used=float(settings.growth_risk_pct),
+                        stop_distance=stop_distance,
+                        target_price=target,
+                        r_multiple=float(settings.growth_target_r),
+                    )
+
+        return None
 
     def _pullback_v2_check(self, candles: list[dict], side: str, atr: float, base_ema_fast: float) -> tuple[bool, list[str]]:
         reasons: list[str] = []
@@ -434,11 +603,31 @@ class TrendPullbackStrategyV1:
         )
 
     def build_plan(self, candles: list[dict], timeframe: str | None, pointer_index: int | None = None) -> TradePlan:
-        # Hard baseline lock: with all features off this must remain identical to current baseline behavior.
-        if not settings.feature_breakout and not settings.feature_pullback_v2 and not settings.feature_vol_sizing:
-            return self._baseline_plan(candles, timeframe, pointer_index)
-
         base_plan = self._baseline_plan(candles, timeframe, pointer_index)
+        if str(settings.active_profile).upper() == 'GROWTH_HUNTER':
+            adx = float((base_plan.regime_gate_metrics or {}).get('adx') or 0.0)
+            growth_plan = self._growth_structural_setup(
+                candles=candles,
+                timeframe=timeframe,
+                adx=adx,
+                atr=base_plan.atr,
+                regime_state=base_plan.regime_state,
+                regime_direction=base_plan.regime_direction,
+                gate_ok=base_plan.regime_gate_ok,
+                gate_reasons=base_plan.regime_gate_reasons,
+                gate_metrics=base_plan.regime_gate_metrics,
+            )
+            if growth_plan:
+                return growth_plan
+            base_plan.decision = 'hold'
+            base_plan.side = None
+            base_plan.reasons = list(dict.fromkeys(base_plan.reasons + ['growth_structural_no_setup']))
+            base_plan.router_selected_strategy = 'growth_structural'
+            base_plan.router_reason = 'growth_structural_wait'
+            base_plan.router_reason_tags = ['growth_structural_wait']
+            base_plan.active_mode = 'GROWTH_STRUCTURAL_SWING'
+            base_plan.mode_reasons = ['growth_structural_mode']
+            return base_plan
         atr = max(base_plan.atr, 1e-9)
         current_close = float(candles[-1]['close']) if candles else 0.0
         gate_metrics = dict(base_plan.regime_gate_metrics or {})
