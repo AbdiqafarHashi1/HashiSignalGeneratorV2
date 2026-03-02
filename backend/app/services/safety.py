@@ -54,7 +54,9 @@ class SafetyService:
         self._incident_order: deque[str] = deque(maxlen=300)
         self._last_governor: dict[str, Any] | None = None
         self._recon_mismatch_cycles = 0
+        self._recon_mismatch_times: deque[datetime] = deque(maxlen=2048)
         self._recon_first_mismatch_at: datetime | None = None
+        self._recon_last_mismatch_at: datetime | None = None
         self._recon_last_detail: dict[str, Any] | None = None
 
     @staticmethod
@@ -154,22 +156,39 @@ class SafetyService:
         return True, None
 
     def record_reconciler(self, mismatch: bool, detail: dict[str, Any] | None = None) -> None:
+        now = datetime.now(timezone.utc)
         self._recon_last_detail = detail or {}
         if mismatch:
             self._recon_mismatch_cycles += 1
+            self._recon_mismatch_times.append(now)
             if not self._recon_first_mismatch_at:
-                self._recon_first_mismatch_at = datetime.now(timezone.utc)
+                self._recon_first_mismatch_at = now
+            self._recon_last_mismatch_at = now
         else:
             self._recon_mismatch_cycles = 0
             self._recon_first_mismatch_at = None
 
+    def reset_reconciler(self) -> None:
+        self._recon_mismatch_cycles = 0
+        self._recon_first_mismatch_at = None
+        self._recon_last_mismatch_at = None
+        self._recon_last_detail = None
+        self._recon_mismatch_times.clear()
+
     def reconciler_status(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        while self._recon_mismatch_times and (now - self._recon_mismatch_times[0]).total_seconds() > 10:
+            self._recon_mismatch_times.popleft()
         persisted_ms = 0
         if self._recon_first_mismatch_at:
-            persisted_ms = int((datetime.now(timezone.utc) - self._recon_first_mismatch_at).total_seconds() * 1000)
+            persisted_ms = int((now - self._recon_first_mismatch_at).total_seconds() * 1000)
+        mismatch_rate_10s = len(self._recon_mismatch_times)
         return {
-            'ok': self._recon_mismatch_cycles == 0,
+            'ok': mismatch_rate_10s == 0,
+            'status': 'OK' if mismatch_rate_10s == 0 else 'WARN',
             'mismatch_cycles': self._recon_mismatch_cycles,
+            'mismatch_rate_10s': mismatch_rate_10s,
+            'last_mismatch_ts': self._recon_last_mismatch_at.isoformat() if self._recon_last_mismatch_at else None,
             'persisted_ms': persisted_ms,
             'detail': self._recon_last_detail or {},
         }
