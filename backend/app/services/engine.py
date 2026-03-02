@@ -445,6 +445,26 @@ class EngineService:
                     await db.commit()
                     return
                 accounting = await PortfolioAccounting().snapshot(db)
+                if self.active_profile == 'GROWTH_HUNTER' and plan.entry_price is not None and plan.stop_price is not None:
+                    entry_px = float(plan.entry_price)
+                    stop_px = float(plan.stop_price)
+                    stop_distance = abs(entry_px - stop_px)
+                    if stop_distance > 0:
+                        risk_amount = float(accounting['equity_now']) * float(settings.growth_risk_pct)
+                        sized_qty = round(max(0.0, risk_amount / stop_distance), 8)
+                        plan.qty = sized_qty
+                        plan.base_qty = sized_qty
+                        plan.final_qty = sized_qty
+                        plan.size_mult = 1.0
+                        plan.stop_distance = stop_distance
+                        plan.risk_pct_used = float(settings.growth_risk_pct)
+                        if plan.side == 'BUY':
+                            plan.target_price = entry_px + (stop_distance * float(settings.growth_target_r))
+                        else:
+                            plan.target_price = entry_px - (stop_distance * float(settings.growth_target_r))
+                        plan.tp1_price = None
+                        plan.tp2_price = plan.target_price
+                        plan.r_multiple = float(settings.growth_target_r)
                 hwm = await self.governor.compute_hwm(
                     redis_client=self.redis,
                     dataset_id=self.replay_dataset_id,
@@ -698,6 +718,10 @@ class EngineService:
                 'base_qty': plan.base_qty,
                 'size_mult': plan.size_mult,
                 'final_qty': plan.final_qty,
+                'risk_pct_used': plan.risk_pct_used,
+                'stop_distance': plan.stop_distance,
+                'target_price': plan.target_price,
+                'R_multiple': plan.r_multiple,
             },
         )
 
@@ -721,16 +745,17 @@ class EngineService:
         bars_held = max(0, replay_clock - self._open_bar_by_symbol.get(trade.symbol, replay_clock))
         time_stop_limit = int(trade.time_stop_bars or settings.time_stop_bars)
 
+        growth_trade = str(trade.strategy_profile or '').upper() == 'GROWTH_HUNTER'
         stop_hit = False
         tp1_hit = False
         tp2_hit = False
         if trade.side == 'BUY':
             stop_hit = low <= stop if stop > 0 else False
-            tp1_hit = high >= tp1 if tp1 > 0 else False
+            tp1_hit = (not growth_trade) and (high >= tp1 if tp1 > 0 else False)
             tp2_hit = high >= tp2 if tp2 > 0 else False
         else:
             stop_hit = high >= stop if stop > 0 else False
-            tp1_hit = low <= tp1 if tp1 > 0 else False
+            tp1_hit = (not growth_trade) and (low <= tp1 if tp1 > 0 else False)
             tp2_hit = low <= tp2 if tp2 > 0 else False
 
         if stop_hit:
@@ -748,7 +773,7 @@ class EngineService:
             return 'EXIT', 'sl_close', ['stop_loss_hit']
 
         if tp2_hit:
-            if not tp1_done and tp1 > 0:
+            if (not growth_trade) and (not tp1_done) and tp1 > 0:
                 await self._partial_close(
                     db=db,
                     trade=trade,
@@ -773,7 +798,7 @@ class EngineService:
             )
             return 'EXIT', 'tp_close', ['tp2_hit']
 
-        if tp1_hit and not tp1_done:
+        if (not growth_trade) and tp1_hit and not tp1_done:
             await self._partial_close(
                 db=db,
                 trade=trade,
@@ -786,7 +811,7 @@ class EngineService:
             self._tp1_done_by_trade[trade.id] = True
             return 'PARTIAL', 'tp1_close', ['tp1_hit']
 
-        if bars_held >= time_stop_limit:
+        if (not growth_trade) and bars_held >= time_stop_limit:
             await self._final_close(
                 db=db,
                 trade=trade,
@@ -1377,6 +1402,10 @@ class EngineService:
             'strategy_profile': trade.strategy_profile or self.active_profile,
             'score_at_entry': float(trade.score_at_entry) if trade.score_at_entry is not None else None,
             'reduceOnly': decision in {'EXIT', 'PARTIAL'},
+            'stop_distance': abs(float(trade.entry_price) - float(trade.stop_price)) if trade.stop_price is not None else None,
+            'target_price': float(trade.tp2_price) if trade.tp2_price is not None else None,
+            'R_multiple': float(settings.growth_target_r) if str(trade.strategy_profile or '').upper() == 'GROWTH_HUNTER' else None,
+            'risk_pct_used': float(settings.growth_risk_pct) if str(trade.strategy_profile or '').upper() == 'GROWTH_HUNTER' else None,
         }
         if pnl_delta is not None:
             payload['pnl_delta'] = float(pnl_delta)

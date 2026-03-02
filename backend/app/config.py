@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     vol_sizing_chop_penalty: float = 0.70
     vol_sizing_trend_bonus: float = 1.10
     vol_sizing_enable_cap: bool = True
+    growth_risk_pct: float = 0.025
+    growth_target_r: float = 3.0
     live_safety_enabled: bool = False
     kill_switch_mode: str = 'off'
     kill_switch_auto: bool = True

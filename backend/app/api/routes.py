@@ -243,7 +243,15 @@ async def list_trades(
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    rows = (await db.execute(select(Trade).order_by(desc(Trade.created_at)).limit(limit).offset(offset))).scalars()
+    rows = (await db.execute(select(Trade).order_by(desc(Trade.created_at)).limit(limit).offset(offset))).scalars().all()
+    trade_ids = [row.id for row in rows]
+    entry_payload_by_trade: dict = {}
+    if trade_ids:
+        exec_rows = (await db.execute(select(Execution).where(Execution.trade_id.in_(trade_ids)).order_by(desc(Execution.created_at)))).scalars().all()
+        for exec_row in exec_rows:
+            payload = exec_row.payload or {}
+            if payload.get('reason') == 'entry' and exec_row.trade_id not in entry_payload_by_trade:
+                entry_payload_by_trade[exec_row.trade_id] = payload
     return {
         'limit': limit,
         'offset': offset,
@@ -282,6 +290,10 @@ async def list_trades(
                 'size_mult': float(row.size_mult) if row.size_mult is not None else None,
                 'final_qty': float(row.final_qty) if row.final_qty is not None else None,
                 'status': row.status,
+                'risk_pct_used': (entry_payload_by_trade.get(row.id) or {}).get('risk_pct_used'),
+                'stop_distance': (entry_payload_by_trade.get(row.id) or {}).get('stop_distance'),
+                'target_price': (entry_payload_by_trade.get(row.id) or {}).get('target_price'),
+                'R_multiple': (entry_payload_by_trade.get(row.id) or {}).get('R_multiple'),
                 'created_at': row.created_at,
             }
             for row in rows
