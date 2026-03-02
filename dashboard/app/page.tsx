@@ -24,7 +24,7 @@ import {
 import { executeCloseNow, executeReduceHalf } from '../lib/execution';
 
 type EventFilter = 'ALL' | 'DECISION' | 'SIGNAL' | 'BLOCKED' | 'ENTRY' | 'PARTIAL' | 'EXIT' | 'ERROR';
-const PROFILE_OPTIONS = ['TREND_STABLE', 'SCALPER_STABLE'] as const;
+const PROFILE_OPTIONS = ['TREND_STABLE', 'GROWTH_HUNTER', 'PROP_HUNTER'] as const;
 const DEFAULT_REPLAY_DATASET =
   (process.env.NEXT_PUBLIC_REPLAY_DATASET_DEFAULT as string | undefined) ||
   'data/datasets/ETHUSDT_15m.csv';
@@ -641,7 +641,8 @@ export default function Page() {
           <div className='flex flex-wrap items-center gap-2 text-[11px] md:text-xs'>
             <ModeBadge mode={String(overview?.mode || 'LIVE').toUpperCase()} />
             <span className='inline-flex h-8 items-center gap-2 rounded border border-zinc-700 bg-zinc-900 px-2.5'><Led on={isRunning} />{isRunning ? 'running' : 'stopped'}</span>
-            <select value={profile} disabled={profileLoading} onChange={async (e) => { try { setProfileLoading(true); await controlSetProfile(e.target.value as 'TREND_STABLE' | 'SCALPER_STABLE'); await loadOverview(); } catch (err: any) { setError(errorText(err)); } finally { setProfileLoading(false); } }} className='h-8 rounded border border-zinc-700 bg-zinc-900 px-2.5'>
+            <span className='inline-flex h-8 items-center rounded border border-cyan-700 bg-cyan-950/20 px-2.5 font-semibold'>Profile {profile}</span>
+            <select value={profile} disabled={profileLoading} onChange={async (e) => { try { setProfileLoading(true); await controlSetProfile(e.target.value as 'TREND_STABLE' | 'GROWTH_HUNTER' | 'PROP_HUNTER'); await loadOverview(); } catch (err: any) { setError(errorText(err)); } finally { setProfileLoading(false); } }} className='h-8 rounded border border-zinc-700 bg-zinc-900 px-2.5'>
               {PROFILE_OPTIONS.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
             <span className='inline-flex h-8 items-center rounded border border-zinc-700 bg-zinc-900 px-2.5'>Clock {text(clock)}</span>
@@ -909,6 +910,7 @@ export default function Page() {
             )}
             {regimeGateOk === false && regimeGateReasons.length > 0 && !regimeWarmup && <div className='rounded border border-rose-800 bg-rose-950/20 px-2 py-1'>Gate reasons: {regimeGateReasons.slice(0, 2).join(', ')}</div>}
             <div className='flex justify-between'><span>Active mode</span><span className='rounded border border-zinc-700 px-2 py-0.5'>{text(activeMode)}</span></div>
+            <div className='flex justify-between'><span>Profile</span><span className='rounded border border-zinc-700 px-2 py-0.5'>{text(latestDecisionEvent?.risk_state_snapshot?.active_profile || overview?.latest_decision?.active_profile || overview?.active_profile)}</span></div>
             <div className='rounded border border-zinc-800 px-2 py-1'>mode_reasons: {modeReasons.length ? modeReasons.join(', ') : 'n/a'}</div>
             <div className='flex justify-between'><span>Regime</span><span className='rounded border border-zinc-700 px-2 py-0.5'>{text(overview?.latest_decision?.regime)}</span></div>
             <div className='flex justify-between font-mono'><span>Decision</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.decision || overview?.latest_decision?.decision)}</span></div>
@@ -918,7 +920,7 @@ export default function Page() {
             <div className='flex justify-between'><span>Router Reason</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.router_reason || overview?.latest_decision?.router_reason)}</span></div>
             <div className='flex justify-between'><span>Current trade_id</span><span className='font-mono'>{text(currentTradeId)}</span></div>
             <div className='rounded border border-zinc-800 px-2 py-1'><span>Last lifecycle event: {text(lastLifecycleEvent?.event_type)} | {text(lastLifecycleEvent?.primary_reason)}</span></div>
-            <div className='flex justify-between'><span>Trade Blocker (primary)</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.trade_blocker_primary || overview?.latest_decision?.trade_blocker_primary)}</span></div>
+            <div className='flex justify-between'><span>Trade Blocker (primary)</span><span>{text(latestDecisionEvent?.risk_state_snapshot?.primary_blocker || latestDecisionEvent?.risk_state_snapshot?.trade_blocker_primary || overview?.latest_decision?.trade_blocker_primary)}</span></div>
             <div className='rounded border border-zinc-800 px-2 py-1'><span>Trade Blockers: {Array.isArray(latestDecisionEvent?.risk_state_snapshot?.trade_blockers) && latestDecisionEvent.risk_state_snapshot.trade_blockers.length ? latestDecisionEvent.risk_state_snapshot.trade_blockers.join(', ') : Array.isArray(overview?.latest_decision?.trade_blockers) && overview.latest_decision.trade_blockers.length ? overview.latest_decision.trade_blockers.join(', ') : 'n/a'}</span></div>
             <div className='flex justify-between'><span>Score</span><span>{fmtNum(latestDecisionEvent?.risk_state_snapshot?.score_total ?? overview?.latest_decision?.score, 2)}</span></div>
             <div className='grid grid-cols-1 gap-1'>

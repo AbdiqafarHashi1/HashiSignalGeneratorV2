@@ -260,6 +260,7 @@ async def list_trades(
                 'tp2_price': float(row.tp2_price) if row.tp2_price is not None else None,
                 'time_stop_bars': row.time_stop_bars,
                 'strategy_name': row.strategy_name,
+                'strategy_profile': row.strategy_profile,
                 'setup_name': row.setup_name,
                 'regime_at_entry': row.regime_at_entry,
                 'score_at_entry': float(row.score_at_entry) if row.score_at_entry is not None else None,
@@ -413,6 +414,7 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
             'top_regime_gate_reasons': (rg_reasons or [])[:2] if isinstance(rg_reasons, list) else None,
             'regime_gate_metrics': snapshot.get('regime_gate_metrics') if isinstance(snapshot, dict) else None,
             'active_mode': snapshot.get('active_mode') if isinstance(snapshot, dict) else None,
+            'active_profile': snapshot.get('active_profile') if isinstance(snapshot, dict) else None,
             'mode_reasons': snapshot.get('mode_reasons') if isinstance(snapshot, dict) else None,
             'final_action': snapshot.get('final_action') if isinstance(snapshot, dict) else None,
             'entry_eligibility': snapshot.get('entry_eligibility') if isinstance(snapshot, dict) else None,
@@ -478,6 +480,21 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
         },
     }
 
+    now_utc = datetime.now(timezone.utc)
+    trades_rows = (await db.execute(select(Trade).order_by(desc(Trade.opened_at)).limit(5000))).scalars().all()
+    today_trades = [
+        t
+        for t in trades_rows
+        if t.opened_at
+        and t.opened_at.astimezone(timezone.utc).date() == now_utc.date()
+    ]
+    entries_by_module: Counter[str] = Counter()
+    last_entry_ts = None
+    for t in today_trades:
+        entries_by_module[str(t.setup_name or t.strategy_name or 'unknown')] += 1
+        if t.opened_at and (last_entry_ts is None or t.opened_at > last_entry_ts):
+            last_entry_ts = t.opened_at
+
     return {
         'equity': equity_now,
         'daily_dd_pct': status['risk']['daily_drawdown_pct'],
@@ -511,6 +528,12 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
         'governor': governor,
         'latest_decision': latest_decision,
         'active_profile': status.get('active_profile') or engine.active_profile,
+        'profile_stats': {
+            'active_profile': status.get('active_profile') or engine.active_profile,
+            'trades_today': len(today_trades),
+            'entries_by_module': dict(entries_by_module),
+            'last_entry_ts': last_entry_ts,
+        },
         'safety': safety_state,
         'pre_trade_decision': pre_trade_decision,
         'day': status.get('day') or {
@@ -545,6 +568,9 @@ async def list_events(
                 'blockers': row.blockers or [],
                 'rationale': row.rationale,
                 'event_type': (row.risk_state_snapshot or {}).get('event_type', row.decision),
+                'active_profile': (row.risk_state_snapshot or {}).get('active_profile'),
+                'active_mode': (row.risk_state_snapshot or {}).get('active_mode'),
+                'primary_blocker': (row.risk_state_snapshot or {}).get('primary_blocker') or (row.risk_state_snapshot or {}).get('trade_blocker_primary'),
                 'risk_state_snapshot': row.risk_state_snapshot or {},
                 'created_at': row.created_at,
             }

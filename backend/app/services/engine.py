@@ -15,6 +15,7 @@ from app.config import settings
 from app.execution.providers import BybitExecution
 from app.models.entities import DecisionEvent, Execution, Position, Trade
 from app.providers.market_data import BybitProvider
+from app.profiles import get_profile_manager
 from app.replay.replay_engine import ReplayEngine
 from app.risk.manager import RiskManager
 from app.services.accounting import PortfolioAccounting
@@ -52,7 +53,9 @@ class EngineService:
         self._history_by_symbol: dict[str, list[dict]] = {}
         self.governor = GovernorService(redis_client=self.redis)
         self.safety = SafetyService()
-        self.active_profile: str = str(settings.strategy_profile).upper()
+        self.profile_manager = get_profile_manager(settings)
+        initial_profile = str(settings.active_profile or settings.strategy_profile or 'TREND_STABLE').upper()
+        self.active_profile: str = self.profile_manager.apply(initial_profile)
         self.last_pre_trade_decision: dict = {
             'allowed': True,
             'reasonCode': None,
@@ -89,6 +92,7 @@ class EngineService:
         }
 
     async def start(self, mode: str = 'live') -> dict:
+        await self._sync_profile_from_store()
         if self.running:
             return self.status()
         self.mode = mode
@@ -97,13 +101,9 @@ class EngineService:
         return self.status()
 
     async def set_profile(self, profile: str) -> dict:
-        allowed = {'TREND_STABLE', 'SCALPER_STABLE'}
-        normalized = str(profile).upper()
-        if normalized not in allowed:
-            raise ValueError(f'Unsupported profile: {profile}')
-        self.active_profile = normalized
+        self.active_profile = self.profile_manager.apply(profile)
         try:
-            await self.redis.set('engine:active_profile', normalized)
+            await self.redis.set('engine:active_profile', self.active_profile)
         except Exception:
             pass
         return {'active_profile': self.active_profile}
@@ -141,6 +141,7 @@ class EngineService:
         dataset_symbol: str | None = None,
         dataset_timeframe: str | None = None,
     ) -> dict:
+        await self._sync_profile_from_store()
         cursor = self.replay.cursor if (self.replay and resume) else 0
         self.replay_symbol = dataset_symbol or settings.default_symbol
         self.replay_timeframe = dataset_timeframe
@@ -187,6 +188,21 @@ class EngineService:
         if self.replay:
             await self.replay.pause()
         return self.replay_status()
+
+    async def _sync_profile_from_store(self) -> None:
+        get_fn = getattr(self.redis, 'get', None)
+        if not callable(get_fn):
+            return
+        try:
+            stored = await get_fn('engine:active_profile')
+        except Exception:
+            return
+        if not stored:
+            return
+        try:
+            self.active_profile = self.profile_manager.apply(str(stored))
+        except ValueError:
+            return
 
     async def resume_replay(self) -> dict:
         if self.replay:
@@ -567,6 +583,7 @@ class EngineService:
             tp2_price=tp2_price,
             time_stop_bars=int(plan.time_stop_bars),
             strategy_name=plan.strategy_name,
+            strategy_profile=self.active_profile,
             setup_name=plan.setup_name,
             regime_at_entry=plan.regime,
             score_at_entry=Decimal(str(plan.score_total)),
@@ -658,6 +675,8 @@ class EngineService:
             price=entry_price,
             fee_delta=fee,
             extra={
+                'active_profile': self.active_profile,
+                'entry_module': plan.router_selected_strategy,
                 'stop_price': float(stop_price) if stop_price is not None else None,
                 'tp1_price': float(tp1_price) if tp1_price is not None else None,
                 'tp2_price': float(tp2_price) if tp2_price is not None else None,
@@ -1341,6 +1360,7 @@ class EngineService:
     ) -> None:
         payload = {
             'event_type': decision,
+            'active_profile': self.active_profile,
             'reason': reason,
             'trade_id': str(trade.id),
             'position_id': str(position.id),
@@ -1354,6 +1374,7 @@ class EngineService:
             'time_stop_bars': int(trade.time_stop_bars or settings.time_stop_bars),
             'strategy_name': trade.strategy_name,
             'setup_name': trade.setup_name,
+            'strategy_profile': trade.strategy_profile or self.active_profile,
             'score_at_entry': float(trade.score_at_entry) if trade.score_at_entry is not None else None,
             'reduceOnly': decision in {'EXIT', 'PARTIAL'},
         }
@@ -1440,6 +1461,7 @@ class EngineService:
                 rationale=rationale,
                 risk_state_snapshot={
                     'event_type': 'DECISION',
+                    'active_profile': self.active_profile,
                     'decision': decision,
                     'score_total': float(plan.score_total),
                     'score_components': plan.score_components,
@@ -1470,6 +1492,7 @@ class EngineService:
                     'router_reason': str(getattr(plan, 'router_reason', 'fallback_hold')),
                     'trade_blocker_primary': dedup_blockers[0] if dedup_blockers else None,
                     'trade_blockers': dedup_blockers,
+                    'primary_blocker': dedup_blockers[0] if (decision != 'ENTER' and dedup_blockers) else None,
                 },
             )
         )
@@ -1482,6 +1505,7 @@ class EngineService:
                 'blockers': dedup_blockers,
                 'regime_gate_ok': plan.regime_gate_ok,
                 'regime_state': plan.regime_state,
+                'active_profile': self.active_profile,
                 'active_mode': plan.active_mode,
             },
         )
