@@ -31,6 +31,7 @@ class Trade(TimestampUUIDMixin, Base):
     stop_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     tp1_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     tp2_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    tp1_be_armed: Mapped[bool] = mapped_column(Boolean, default=False)
     time_stop_bars: Mapped[int | None] = mapped_column(Integer, nullable=True)
     strategy_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     strategy_profile: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
