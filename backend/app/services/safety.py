@@ -56,6 +56,7 @@ class SafetyService:
         self._recon_mismatch_cycles = 0
         self._recon_first_mismatch_at: datetime | None = None
         self._recon_last_detail: dict[str, Any] | None = None
+        self._recon_mismatch_ts: deque[datetime] = deque(maxlen=1000)
 
     @staticmethod
     def _normalize_mode(raw: str | None) -> KillSwitchMode:
@@ -155,21 +156,41 @@ class SafetyService:
 
     def record_reconciler(self, mismatch: bool, detail: dict[str, Any] | None = None) -> None:
         self._recon_last_detail = detail or {}
+        now = datetime.now(timezone.utc)
         if mismatch:
             self._recon_mismatch_cycles += 1
             if not self._recon_first_mismatch_at:
-                self._recon_first_mismatch_at = datetime.now(timezone.utc)
+                self._recon_first_mismatch_at = now
+            self._recon_mismatch_ts.append(now)
         else:
             self._recon_mismatch_cycles = 0
             self._recon_first_mismatch_at = None
+        self._trim_reconciler_window(now)
+
+    def _trim_reconciler_window(self, now: datetime) -> None:
+        while self._recon_mismatch_ts and (now - self._recon_mismatch_ts[0]).total_seconds() > 10:
+            self._recon_mismatch_ts.popleft()
+
+    def reset_reconciler(self) -> None:
+        self._recon_mismatch_cycles = 0
+        self._recon_first_mismatch_at = None
+        self._recon_last_detail = None
+        self._recon_mismatch_ts.clear()
 
     def reconciler_status(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        self._trim_reconciler_window(now)
         persisted_ms = 0
         if self._recon_first_mismatch_at:
-            persisted_ms = int((datetime.now(timezone.utc) - self._recon_first_mismatch_at).total_seconds() * 1000)
+            persisted_ms = int((now - self._recon_first_mismatch_at).total_seconds() * 1000)
+        mismatch_rate_10s = len(self._recon_mismatch_ts)
+        last_mismatch_ts = self._recon_mismatch_ts[-1].isoformat() if self._recon_mismatch_ts else None
         return {
-            'ok': self._recon_mismatch_cycles == 0,
+            'ok': mismatch_rate_10s == 0,
+            'status': 'OK' if mismatch_rate_10s == 0 else 'WARN',
             'mismatch_cycles': self._recon_mismatch_cycles,
+            'mismatch_rate_10s': mismatch_rate_10s,
+            'last_mismatch_ts': last_mismatch_ts,
             'persisted_ms': persisted_ms,
             'detail': self._recon_last_detail or {},
         }

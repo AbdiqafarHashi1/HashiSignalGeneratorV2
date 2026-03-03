@@ -287,6 +287,9 @@ export default function Page() {
   const eventsRef = useRef<any[]>([]);
   const positionsRef = useRef<any[]>([]);
   const [lastStablePosition, setLastStablePosition] = useState<any | null>(null);
+  const overviewInFlightRef = useRef(false);
+  const controlInFlightRef = useRef(false);
+  const [overviewBackoffMs, setOverviewBackoffMs] = useState(500);
 
   const isRunning = Boolean(overview?.replay?.is_running);
   const ageLabel = (ts: number | null) => (ts ? `${Math.max(0, uiNowMs - ts)} ms ago` : '-');
@@ -320,20 +323,26 @@ export default function Page() {
   }, []);
 
   const loadOverview = useCallback(async () => {
+    if (overviewInFlightRef.current || controlInFlightRef.current) return;
+    overviewInFlightRef.current = true;
     const reqId = ++overviewReqSeq.current;
     const startedAt = Date.now();
     try {
-      const res = await fetchOverview(1200);
+      const res = await fetchOverview(5000);
       if (reqId !== overviewReqSeq.current) return;
       setOverview(res || {});
       markFetchMeta('overview', { lastOkAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastCount: null, lastErr: null });
       setError('');
       setLastRefreshAt(Date.now());
+      setOverviewBackoffMs(500);
       setPollTick((t) => t + 1);
     } catch (e: any) {
       markFetchMeta('overview', { lastErrAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastErr: errorText(e) });
-      setError(errorText(e));
+      setError((prev) => prev || errorText(e));
+      setOverviewBackoffMs((prev) => Math.min(5000, Math.max(500, prev * 2)));
       setPollTick((t) => t + 1);
+    } finally {
+      overviewInFlightRef.current = false;
     }
   }, [markFetchMeta]);
 
@@ -444,7 +453,7 @@ export default function Page() {
     void loadDatasets();
   }, [loadDatasets]);
 
-  usePollingLoop(() => loadOverview(), () => (isRunningRef.current ? 750 : 3000));
+  usePollingLoop(() => loadOverview(), () => (isRunningRef.current ? Math.max(500, overviewBackoffMs) : Math.max(1000, overviewBackoffMs)));
   usePollingLoop(() => loadStreams(), () => (isRunningRef.current ? 1200 : 3500));
 
   useEffect(() => {
@@ -453,7 +462,7 @@ export default function Page() {
     return () => clearTimeout(timer);
   }, [toast]);
 
-  const canStart = Boolean(selectedDatasetId);
+  const canStart = Boolean(selectedDatasetId || DEFAULT_REPLAY_DATASET);
   const profile = String(overview?.active_profile || PROFILE_OPTIONS[0]).toUpperCase();
   const clock = overview?.replay?.candle_ts;
   const pointer = Number(overview?.replay?.pointer || 0);
@@ -620,6 +629,20 @@ export default function Page() {
     return null;
   }, [overview?.open_positions, positions.length]);
 
+
+  const performControl = useCallback(async (action: () => Promise<any>) => {
+    controlInFlightRef.current = true;
+    try {
+      await action();
+      await loadOverview();
+      await loadStreams();
+    } catch (e: any) {
+      setError(errorText(e));
+    } finally {
+      controlInFlightRef.current = false;
+    }
+  }, [loadOverview, loadStreams]);
+
   const handleUpload = async (file: File) => {
     try {
       const res = await uploadDataset(file);
@@ -654,7 +677,7 @@ export default function Page() {
             <div className='flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between'>
               <div className='flex flex-wrap items-center gap-3'>
                 <select value={selectedDatasetId} onChange={(e) => setSelectedDatasetId(e.target.value)} className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 min-w-[230px] text-sm'>
-                  <option value=''>Select dataset</option>
+                  <option value=''>Default ({DEFAULT_REPLAY_DATASET})</option>
                   {datasets.map((d) => <option key={d.id} value={d.id}>{d.filename}</option>)}
                 </select>
                 <input ref={fileRef} type='file' accept='.csv' className='hidden' onChange={(e) => e.target.files?.[0] && void handleUpload(e.target.files[0])} />
@@ -665,12 +688,12 @@ export default function Page() {
               </div>
 
               <div className='flex flex-wrap items-center gap-3'>
-                <button className='h-9 rounded border border-cyan-700 bg-cyan-950/30 px-3 text-sm text-cyan-200 disabled:opacity-50 disabled:cursor-not-allowed' disabled={!canStart} title={canStart ? '' : 'Select or upload a dataset first'} onClick={() => replayStart({ dataset_id: selectedDatasetId, speed: Math.max(1, Math.round(speed)) }).then(loadOverview).then(loadStreams).catch((e) => setError(errorText(e)))}>Start</button>
-                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => replayPause().then(loadOverview).catch((e) => setError(errorText(e)))}>Pause</button>
-                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => replayResume().then(loadOverview).catch((e) => setError(errorText(e)))}>Resume</button>
-                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => replayStep().then(loadOverview).then(loadStreams).catch((e) => setError(errorText(e)))}>Step</button>
-                <button className='h-9 rounded border border-rose-700 bg-rose-950/30 px-3 text-sm text-rose-200' onClick={() => replayStop().then(loadOverview).catch((e) => setError(errorText(e)))}>Stop</button>
-                <button className='h-9 rounded border border-rose-800 bg-rose-950/20 px-3 text-sm text-rose-100' onClick={() => replayReset().then(loadOverview).then(loadStreams).catch((e) => setError(errorText(e)))}>Reset</button>
+                <button className='h-9 rounded border border-cyan-700 bg-cyan-950/30 px-3 text-sm text-cyan-200 disabled:opacity-50 disabled:cursor-not-allowed' disabled={!canStart} title={canStart ? '' : 'Select or upload a dataset first'} onClick={() => performControl(() => replayStart(selectedDatasetId ? { dataset_id: selectedDatasetId, speed: Math.max(1, Math.round(speed)) } : { csv_path: DEFAULT_REPLAY_DATASET, speed: Math.max(1, Math.round(speed)) }))}>Start</button>
+                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => performControl(() => replayPause())}>Pause</button>
+                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => performControl(() => replayResume())}>Resume</button>
+                <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => performControl(() => replayStep())}>Step</button>
+                <button className='h-9 rounded border border-rose-700 bg-rose-950/30 px-3 text-sm text-rose-200' onClick={() => performControl(() => replayStop())}>Stop</button>
+                <button className='h-9 rounded border border-rose-800 bg-rose-950/20 px-3 text-sm text-rose-100' onClick={() => performControl(() => replayReset())}>Reset</button>
                 <div className='flex h-9 items-center gap-2 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm'>
                   <span>Speed</span>
                   <input type='range' min='1' max='10' value={Math.round(speed)} onChange={(e) => setSpeed(Number(e.target.value) || 1)} />

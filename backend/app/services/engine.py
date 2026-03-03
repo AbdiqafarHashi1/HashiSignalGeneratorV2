@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections import Counter, deque
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -23,6 +24,7 @@ from app.services.governor import GovernorService
 from app.services.safety import KillSwitchMode, SafetyService
 from app.strategies.base import MomentumStrategy
 from app.strategies.trend_v1 import TradePlan, TrendPullbackStrategyV1
+from app.telegram.service import TelegramService
 
 
 class EngineService:
@@ -90,6 +92,7 @@ class EngineService:
             'entry_blockers_when_regime_pass': Counter(),
             'manage_reasons': Counter(),
         }
+        self.telegram = TelegramService()
 
     async def start(self, mode: str = 'live') -> dict:
         await self._sync_profile_from_store()
@@ -106,7 +109,7 @@ class EngineService:
             await self.redis.set('engine:active_profile', self.active_profile)
         except Exception:
             pass
-        return {'active_profile': self.active_profile}
+        return {'ok': True, 'active_profile': self.active_profile, 'state': self.status()}
 
     def safety_status(self) -> dict:
         return self.safety.status()
@@ -130,7 +133,27 @@ class EngineService:
             await self.replay.stop()
         if self.task:
             await asyncio.wait([self.task], timeout=1)
-        return self.status()
+        return {'ok': True, 'state': self.status()}
+
+    async def reset_replay(self, clear_dataset: bool = False) -> dict:
+        if self.replay:
+            await self.replay.stop()
+        self.running = False
+        self.replay = None
+        if clear_dataset:
+            self.replay_dataset_id = None
+        self.tick = 0
+        self.last_event_at = None
+        self._open_trade_id_by_symbol.clear()
+        self._open_bar_by_symbol.clear()
+        self._tp1_done_by_trade.clear()
+        self._history_by_symbol.clear()
+        self._decision_traces.clear()
+        self._lifecycle_events.clear()
+        self.safety.reset_reconciler()
+        with contextlib.suppress(Exception):
+            await self.redis.delete('engine:state', 'replay:dataset_path')
+        return {'ok': True, 'state': self.status()}
 
     async def start_replay(
         self,
@@ -143,6 +166,7 @@ class EngineService:
     ) -> dict:
         await self._sync_profile_from_store()
         cursor = self.replay.cursor if (self.replay and resume) else 0
+        csv_path = csv_path or await self.resolve_replay_dataset_path(dataset_id=dataset_id)
         self.replay_symbol = dataset_symbol or settings.default_symbol
         self.replay_timeframe = dataset_timeframe
         self.replay = ReplayEngine(
@@ -153,6 +177,7 @@ class EngineService:
             dataset_timeframe=self.replay_timeframe,
         )
         self.replay_dataset_id = dataset_id
+        await self.redis.set('replay:dataset_path', csv_path)
         self._history_by_symbol.clear()
         self._decision_traces.clear()
         self._trace_summary = {
@@ -170,8 +195,10 @@ class EngineService:
             'manage_reasons': Counter(),
         }
         self._lifecycle_events.clear()
+        self.safety.reset_reconciler()
         await self.replay.start()
-        return await self.start(mode='replay')
+        payload = await self.start(mode='replay')
+        return payload
 
     async def stop_replay(self) -> dict:
         if self.replay:
@@ -184,10 +211,25 @@ class EngineService:
         self._print_lifecycle_diagnostics()
         return await self.stop()
 
+    async def resolve_replay_dataset_path(self, dataset_id: str | None = None) -> str:
+        if dataset_id:
+            async with self.session_factory() as db:
+                from app.models.entities import ReplayDataset
+
+                row = await db.get(ReplayDataset, dataset_id)
+                if row and row.stored_path:
+                    return str(row.stored_path)
+        cached = None
+        with contextlib.suppress(Exception):
+            cached = await self.redis.get('replay:dataset_path')
+        if cached:
+            return str(cached)
+        return str(settings.replay_dataset_default)
+
     async def pause_replay(self) -> dict:
         if self.replay:
             await self.replay.pause()
-        return self.replay_status()
+        return {'ok': True, 'state': self.status()}
 
     async def _sync_profile_from_store(self) -> None:
         get_fn = getattr(self.redis, 'get', None)
@@ -207,13 +249,13 @@ class EngineService:
     async def resume_replay(self) -> dict:
         if self.replay:
             await self.replay.resume()
-        return self.replay_status()
+        return {'ok': True, 'state': self.status()}
 
     async def step_replay(self) -> dict:
         tick = await self._next_tick(force_step=True)
         if tick:
             await self._handle_replay_tick(tick=tick)
-        return self.replay_status()
+        return {'ok': True, 'state': self.status()}
 
     async def manual_close_trade(self, trade_id: UUID) -> dict:
         if self.mode != 'replay' or not self.replay:
@@ -247,7 +289,7 @@ class EngineService:
                 replay_clock=int(tick.get('replay_clock') or pointer),
             )
             await db.commit()
-        return {'ok': True, 'trade_id': str(trade_id)}
+        return {'ok': True, 'trade_id': str(trade_id), 'state': self.status()}
 
     def replay_status(self) -> dict:
         if not self.replay:
@@ -315,6 +357,13 @@ class EngineService:
                         evidence=runtime.evidence,
                     )
             await self._publish_state()
+            if self.telegram.should_send_status():
+                st = self.status()
+                self.telegram.notify(
+                    f"[{str(st.get('mode','live')).upper()}] {self.replay_symbol} {self.active_profile} "
+                    f"equity={st.get('risk',{}).get('equity')} dd={st.get('risk',{}).get('global_drawdown_pct')}% "
+                    f"pretrade={'OK' if st.get('pre_trade_decision',{}).get('allowed', True) else st.get('pre_trade_decision',{}).get('reasonCode')}"
+                )
             await asyncio.sleep(0.5)
 
     async def _next_tick(self, force_step: bool = False) -> dict | None:
@@ -682,6 +731,7 @@ class EngineService:
             mark_price=entry_price,
             entry_qty=qty,
         )
+
         await self._emit_trade_event(
             db=db,
             ts_ms=entry_ts_ms,
@@ -723,6 +773,11 @@ class EngineService:
                 'target_price': plan.target_price,
                 'R_multiple': plan.r_multiple,
             },
+        )
+        self.telegram.notify(
+            f"[REPLAY] {symbol} {self.active_profile} ENTRY {side} qty={float(qty):.4f} entry={float(entry_price):.4f} "
+            f"sl={float(stop_price) if stop_price is not None else '-'} tp={float(tp2_price) if tp2_price is not None else float(tp1_price) if tp1_price is not None else '-'} "
+            f"risk_pct={plan.risk_pct_used if plan.risk_pct_used is not None else '-'}"
         )
 
     async def _evaluate_open_trade(
@@ -1365,6 +1420,11 @@ class EngineService:
                 'pnl_net': float(pnl_net),
                 'fees_total': float(fees_total),
             },
+        )
+
+        self.telegram.notify(
+            f"[REPLAY] {symbol} {self.active_profile} EXIT reason={reason} pnl_net={float(pnl_net):.4f} fees={float(fees_total):.4f} "
+            f"equity={float(settings.equity_start) + float(self.daily_state.get('daily_realized_pnl', 0.0)):.2f}"
         )
 
     async def _emit_trade_event(

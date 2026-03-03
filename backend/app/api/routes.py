@@ -62,6 +62,8 @@ async def replay_start(
         dataset_id = str(dataset.id)
         csv_path = dataset.stored_path
     if not csv_path:
+        csv_path = await engine.resolve_replay_dataset_path(dataset_id=dataset_id)
+    if not csv_path:
         raise HTTPException(status_code=400, detail='Provide dataset_id, filename, or csv_path')
     if not Path(csv_path).exists():
         raise HTTPException(status_code=400, detail=f'csv_path not found: {csv_path}')
@@ -89,6 +91,13 @@ async def replay_start(
 @router.post('/replay/stop')
 async def replay_stop(engine: EngineService = Depends(get_engine_service)) -> dict:
     return await engine.stop_replay()
+
+
+@router.post('/replay/reset')
+async def replay_reset(engine: EngineService = Depends(get_engine_service)) -> dict:
+    _OVERVIEW_CACHE['payload'] = None
+    _OVERVIEW_CACHE['ts'] = 0.0
+    return await engine.reset_replay()
 
 
 @router.post('/replay/pause')
@@ -167,6 +176,8 @@ async def replay_upload(file: UploadFile = File(...), db: AsyncSession = Depends
         await db.rollback()
         Path(stored_path).unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f'Unable to save dataset metadata: {exc.__class__.__name__}') from exc
+    _OVERVIEW_CACHE['payload'] = None
+    _OVERVIEW_CACHE['ts'] = 0.0
     return {
         'dataset_id': dataset_id,
         'filename': dataset.filename,
@@ -347,216 +358,155 @@ async def telegram_test(db: AsyncSession = Depends(get_db)) -> dict:
 
 @router.get('/overview')
 async def overview(engine: EngineService = Depends(get_engine_service), db: AsyncSession = Depends(get_db)) -> dict:
-    open_positions = (await db.execute(select(Position).where(Position.is_open.is_(True)))).scalars().all()
-    status = engine.status()
-    accounting = await PortfolioAccounting().snapshot(db)
-    replay_status = engine.replay_status()
+    return await build_overview_cached(engine=engine, db=db)
 
-    replay_payload = {
-        'dataset_id': None,
-        'pointer': None,
-        'candle_ts': None,
-        'is_running': False,
-        'speed': None,
-    }
-    if str(status.get('mode', '')).lower() == 'replay':
+
+_OVERVIEW_CACHE: dict = {'ts': 0.0, 'payload': None}
+_OVERVIEW_LOCK = __import__('asyncio').Lock()
+
+
+async def _query_with_timeout(coro, timeout: float, default):
+    try:
+        return await __import__('asyncio').wait_for(coro, timeout=timeout)
+    except Exception:
+        return default
+
+
+async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict:
+    import time
+    now = time.monotonic()
+    cached = _OVERVIEW_CACHE.get('payload')
+    if cached is not None and (now - float(_OVERVIEW_CACHE.get('ts') or 0.0)) < 0.4:
+        return cached
+    async with _OVERVIEW_LOCK:
+        now = time.monotonic()
+        cached = _OVERVIEW_CACHE.get('payload')
+        if cached is not None and (now - float(_OVERVIEW_CACHE.get('ts') or 0.0)) < 0.4:
+            return cached
+
+        partial_reasons: list[str] = []
+        status = engine.status()
+        replay_status = engine.replay_status()
         replay_payload = {
             'dataset_id': replay_status.get('dataset_id'),
             'pointer': replay_status.get('pointer_index'),
             'candle_ts': replay_status.get('current_ts'),
             'is_running': bool(replay_status.get('running')),
             'speed': replay_status.get('speed'),
+        } if str(status.get('mode', '')).lower() == 'replay' else {
+            'dataset_id': None, 'pointer': None, 'candle_ts': None, 'is_running': False, 'speed': None,
         }
 
-    equity_now = float(accounting['equity_now'])
-    equity_start = float(accounting['equity_start'])
+        accounting = await _query_with_timeout(PortfolioAccounting().snapshot(db), 0.12, None)
+        if accounting is None:
+            partial_reasons.append('accounting_timeout')
+            accounting = {
+                'equity_start': settings.equity_start,
+                'equity_now': settings.equity_start,
+                'realized_pnl_net': 0.0,
+                'unrealized_pnl': 0.0,
+                'fees_total': 0.0,
+                'reconcile_delta': 0.0,
+                'reconcile_ok': True,
+                'accounting': {},
+            }
 
-    governor_service = GovernorService(redis_client=engine.redis)
-    hwm = await governor_service.compute_hwm(
-        redis_client=engine.redis,
-        dataset_id=replay_payload.get('dataset_id'),
-        equity_start=equity_start,
-        equity_now=equity_now,
-    )
+        open_positions_count = await _query_with_timeout(db.scalar(select(__import__('sqlalchemy').func.count()).select_from(Position).where(Position.is_open.is_(True))), 0.1, 0)
+        if open_positions_count is None:
+            open_positions_count = 0
+            partial_reasons.append('positions_timeout')
 
-    global_dd_pct = ((hwm - equity_now) / hwm * 100) if hwm > 0 else 0.0
-    target_pct = float(settings.monthly_target_pct)
-    progress_pct = ((equity_now - equity_start) / equity_start * 100) if equity_start else 0.0
-    progress_ratio = (progress_pct / target_pct) if target_pct else 0.0
+        latest = await _query_with_timeout((db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1))).then(lambda x: x.scalar_one_or_none()) if False else db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1)), 0.1, None)
+        latest_row = latest.scalar_one_or_none() if latest is not None else None
+        if latest is None:
+            partial_reasons.append('decision_timeout')
 
-    latest = (
-        await db.execute(
-            select(DecisionEvent)
-            .where(DecisionEvent.decision == 'DECISION')
-            .order_by(desc(DecisionEvent.created_at))
-            .limit(1)
+        latest_decision = {'ts': None, 'symbol': None, 'decision': None, 'regime': None, 'score': None, 'message': None, 'blockers_top': None, 'regime_gate_ok': None, 'top_regime_gate_reasons': None, 'regime_gate_metrics': None, 'active_mode': None, 'mode_reasons': None}
+        if latest_row:
+            snapshot = latest_row.risk_state_snapshot or {}
+            latest_decision = {
+                'ts': datetime.fromtimestamp((latest_row.ts or 0) / 1000, tz=timezone.utc).isoformat() if latest_row.ts else None,
+                'symbol': latest_row.symbol,
+                'decision': latest_row.decision,
+                'regime': latest_row.regime,
+                'score': float(latest_row.signal_score) if latest_row.signal_score is not None else None,
+                'message': latest_row.rationale,
+                'blockers_top': (latest_row.blockers or [])[:5] if latest_row.blockers is not None else None,
+                'regime_gate_ok': snapshot.get('regime_gate_ok') if isinstance(snapshot, dict) else None,
+                'top_regime_gate_reasons': ((snapshot.get('regime_gate_reasons') or [])[:2] if isinstance(snapshot, dict) else None),
+                'regime_gate_metrics': snapshot.get('regime_gate_metrics') if isinstance(snapshot, dict) else None,
+                'active_mode': snapshot.get('active_mode') if isinstance(snapshot, dict) else None,
+                'mode_reasons': snapshot.get('mode_reasons') if isinstance(snapshot, dict) else None,
+            }
+
+        equity_now = float(accounting['equity_now'])
+        equity_start = float(accounting['equity_start'])
+        governor_service = GovernorService(redis_client=engine.redis)
+        hwm = await _query_with_timeout(
+            governor_service.compute_hwm(redis_client=engine.redis, dataset_id=replay_payload.get('dataset_id'), equity_start=equity_start, equity_now=equity_now),
+            0.1,
+            max(equity_start, equity_now),
         )
-    ).scalar_one_or_none()
-    if not latest:
-        latest = (
-            await db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1))
-        ).scalar_one_or_none()
-    latest_decision = {
-        'ts': None,
-        'symbol': None,
-        'decision': None,
-        'regime': None,
-        'score': None,
-        'message': None,
-        'blockers_top': None,
-        'regime_gate_ok': None,
-        'top_regime_gate_reasons': None,
-        'regime_gate_metrics': None,
-        'active_mode': None,
-        'mode_reasons': None,
-    }
-    if latest:
-        ts_iso = datetime.fromtimestamp((latest.ts or 0) / 1000, tz=timezone.utc).isoformat() if latest.ts else None
-        snapshot = latest.risk_state_snapshot or {}
-        rg_reasons = snapshot.get('regime_gate_reasons') if isinstance(snapshot, dict) else None
-        latest_decision = {
-            'ts': ts_iso,
-            'symbol': latest.symbol,
-            'decision': latest.decision,
-            'regime': latest.regime,
-            'score': float(latest.signal_score) if latest.signal_score is not None else None,
-            'message': latest.rationale,
-            'blockers_top': (latest.blockers or [])[:5] if latest.blockers is not None else None,
-            'regime_gate_ok': snapshot.get('regime_gate_ok') if isinstance(snapshot, dict) else None,
-            'top_regime_gate_reasons': (rg_reasons or [])[:2] if isinstance(rg_reasons, list) else None,
-            'regime_gate_metrics': snapshot.get('regime_gate_metrics') if isinstance(snapshot, dict) else None,
-            'active_mode': snapshot.get('active_mode') if isinstance(snapshot, dict) else None,
-            'active_profile': snapshot.get('active_profile') if isinstance(snapshot, dict) else None,
-            'mode_reasons': snapshot.get('mode_reasons') if isinstance(snapshot, dict) else None,
-            'final_action': snapshot.get('final_action') if isinstance(snapshot, dict) else None,
-            'entry_eligibility': snapshot.get('entry_eligibility') if isinstance(snapshot, dict) else None,
-            'router_selected_strategy': snapshot.get('router_selected_strategy') if isinstance(snapshot, dict) else None,
-            'trade_blocker_primary': snapshot.get('trade_blocker_primary') if isinstance(snapshot, dict) else None,
-            'trade_blockers': snapshot.get('trade_blockers') if isinstance(snapshot, dict) else None,
-            'router_reason': snapshot.get('router_reason') if isinstance(snapshot, dict) else None,
-        }
+        if hwm is None:
+            hwm = max(equity_start, equity_now)
+            partial_reasons.append('hwm_timeout')
+        global_dd_pct = ((hwm - equity_now) / hwm * 100) if hwm > 0 else 0.0
 
-    obs_latest = engine.observability_snapshot(last_n=1).get('decision_traces', [])
-    if obs_latest:
-        latest_trace = obs_latest[-1]
-        latest_decision['final_action'] = latest_trace.get('final_action')
-        latest_decision['entry_eligibility'] = latest_trace.get('entry_eligibility')
-        latest_decision['router_selected_strategy'] = latest_trace.get('router', {}).get('selected')
-        latest_decision['trade_blocker_primary'] = latest_trace.get('trade_blocker_primary')
-        latest_decision['trade_blockers'] = latest_trace.get('trade_blockers')
-        latest_decision['router_reason'] = latest_trace.get('router', {}).get('reason')
+        safety_state = status.get('safety') or engine.safety_status()
+        governor = {'eligible': True, 'blockers': [], 'stats': {}, 'config': {}}
+        gov_now = None
+        if replay_payload.get('candle_ts'):
+            try:
+                gov_now = datetime.fromisoformat(str(replay_payload.get('candle_ts')).replace('Z', '+00:00'))
+            except Exception:
+                gov_now = None
+        governor = await _query_with_timeout(governor_service.evaluate_entry(db=db, now_ts=gov_now, dataset_id=replay_payload.get('dataset_id'), equity_start_day=equity_start, global_dd_pct=global_dd_pct, replay_mode=str(status.get('mode', '')).lower() == 'replay'), 0.15, governor)
 
-    gov_now = None
-    if replay_payload.get('candle_ts'):
+        risk_state_payload = dict(status['risk'])
+        risk_state_payload['status'] = 'ELIGIBLE' if governor.get('eligible', True) else 'BLOCKED'
+        risk_state_payload['reason'] = ', '.join([str(b.get('reason')) for b in (governor.get('blockers') or [])[:3]]) if (governor.get('blockers') or []) else None
+
+        dataset_path = settings.replay_dataset_default
         try:
-            gov_now = datetime.fromisoformat(str(replay_payload.get('candle_ts')).replace('Z', '+00:00'))
+            dataset_path = await engine.redis.get('replay:dataset_path') or settings.replay_dataset_default
         except Exception:
-            gov_now = None
-    governor = await governor_service.evaluate_entry(
-        db=db,
-        now_ts=gov_now,
-        dataset_id=replay_payload.get('dataset_id'),
-        equity_start_day=equity_start,
-        global_dd_pct=global_dd_pct,
-        replay_mode=str(status.get('mode', '')).lower() == 'replay',
-    )
-    risk_state_payload = dict(status['risk'])
-    risk_state_payload['status'] = 'ELIGIBLE' if governor['eligible'] else 'BLOCKED'
-    risk_state_payload['reason'] = ', '.join([str(b.get('reason')) for b in governor['blockers'][:3]]) if governor['blockers'] else None
-    safety_state = status.get('safety') or engine.safety_status()
-    gov_stats = governor.get('stats') or {}
-    gov_cfg = governor.get('config') or {}
-    daily_limit_pct = float(gov_cfg.get('max_daily_loss_pct') or 0.0)
-    daily_pnl_abs = abs(float(gov_stats.get('daily_pnl_net') or 0.0))
-    daily_loss_pct = (daily_pnl_abs / daily_limit_pct * 100.0) if daily_limit_pct > 0 else 0.0
-    pre_trade_decision = status.get('pre_trade_decision') or {}
-    pre_trade_decision = {
-        'allowed': bool(governor.get('eligible', True)),
-        'reasonCode': (
-            str((governor.get('blockers') or [{}])[0].get('name'))
-            if not governor.get('eligible', True)
-            else None
-        ),
-        'reasonDetail': (
-            str((governor.get('blockers') or [{}])[0].get('detail') or (governor.get('blockers') or [{}])[0].get('reason'))
-            if not governor.get('eligible', True)
-            else None
-        ),
-        'metrics': {
-            'ddPct': float(gov_stats.get('global_dd_pct') or 0.0),
-            'dailyLossPct': daily_loss_pct,
-            'consecutiveLosses': int(gov_stats.get('consecutive_losses') or 0),
-            'tradesPerDay': int(gov_stats.get('trades_today') or 0),
-            'stalenessMs': safety_state.get('staleness_ms'),
-            'errorRate': float(safety_state.get('error_rate') or 0.0),
-        },
-    }
-
-    now_utc = datetime.now(timezone.utc)
-    trades_rows = (await db.execute(select(Trade).order_by(desc(Trade.opened_at)).limit(5000))).scalars().all()
-    today_trades = [
-        t
-        for t in trades_rows
-        if t.opened_at
-        and t.opened_at.astimezone(timezone.utc).date() == now_utc.date()
-    ]
-    entries_by_module: Counter[str] = Counter()
-    last_entry_ts = None
-    for t in today_trades:
-        entries_by_module[str(t.setup_name or t.strategy_name or 'unknown')] += 1
-        if t.opened_at and (last_entry_ts is None or t.opened_at > last_entry_ts):
-            last_entry_ts = t.opened_at
-
-    return {
-        'equity': equity_now,
-        'daily_dd_pct': status['risk']['daily_drawdown_pct'],
-        'global_dd_pct': status['risk']['global_drawdown_pct'],
-        'monthly_progress_pct': status['risk']['monthly_progress_pct'],
-        'open_positions': len(open_positions),
-        'risk_state': risk_state_payload,
-        'risk_state_reason': risk_state_payload.get('reason'),
-        'mode': status['mode'].upper(),
-        'leverage': status['risk']['leverage'],
-        'replay': replay_payload,
-        'equity_start': equity_start,
-        'equity_now': equity_now,
-        'realized_pnl_net': float(accounting['realized_pnl_net']),
-        'unrealized_pnl': float(accounting['unrealized_pnl']),
-        'fees_total': float(accounting['fees_total']),
-        'reconcile_delta': float(accounting['reconcile_delta']),
-        'reconcile_ok': bool(accounting['reconcile_ok']),
-        'accounting': accounting['accounting'],
-        'dd': {
-            'hwm': hwm,
-            'global_dd_pct': global_dd_pct,
-            'daily_dd_pct': 0.0,
-            'dd_daily_supported': False,
-        },
-        'goal': {
-            'target_pct': target_pct,
-            'progress_pct': progress_pct,
-            'progress_ratio': progress_ratio,
-        },
-        'governor': governor,
-        'latest_decision': latest_decision,
-        'active_profile': status.get('active_profile') or engine.active_profile,
-        'profile_stats': {
+            dataset_path = settings.replay_dataset_default
+        payload = {
+            'equity': equity_now,
+            'daily_dd_pct': status['risk']['daily_drawdown_pct'],
+            'global_dd_pct': status['risk']['global_drawdown_pct'],
+            'monthly_progress_pct': status['risk']['monthly_progress_pct'],
+            'open_positions': int(open_positions_count or 0),
+            'risk_state': risk_state_payload,
+            'risk_state_reason': risk_state_payload.get('reason'),
+            'mode': status['mode'].upper(),
+            'leverage': status['risk']['leverage'],
+            'replay': replay_payload,
+            'equity_start': equity_start,
+            'equity_now': equity_now,
+            'realized_pnl_net': float(accounting['realized_pnl_net']),
+            'unrealized_pnl': float(accounting['unrealized_pnl']),
+            'fees_total': float(accounting['fees_total']),
+            'reconcile_delta': float(accounting['reconcile_delta']),
+            'reconcile_ok': bool(accounting['reconcile_ok']),
+            'accounting': accounting['accounting'],
+            'dd': {'hwm': hwm, 'global_dd_pct': global_dd_pct, 'daily_dd_pct': 0.0, 'dd_daily_supported': False},
+            'goal': {'target_pct': float(settings.monthly_target_pct), 'progress_pct': ((equity_now - equity_start) / equity_start * 100) if equity_start else 0.0, 'progress_ratio': 0.0},
+            'governor': governor,
+            'latest_decision': latest_decision,
             'active_profile': status.get('active_profile') or engine.active_profile,
-            'trades_today': len(today_trades),
-            'entries_by_module': dict(entries_by_module),
-            'last_entry_ts': last_entry_ts,
-        },
-        'safety': safety_state,
-        'pre_trade_decision': pre_trade_decision,
-        'day': status.get('day') or {
-            'day_key': None,
-            'rollover_in_effect': False,
-            'daily_consecutive_losses': 0,
-            'daily_realized_pnl': 0.0,
-            'daily_fees': 0.0,
-            'daily_trade_count': 0,
-        },
-    }
+            'profile_stats': {'active_profile': status.get('active_profile') or engine.active_profile, 'trades_today': 0, 'entries_by_module': {}, 'last_entry_ts': None},
+            'safety': safety_state,
+            'pre_trade_decision': status.get('pre_trade_decision') or {'allowed': True, 'reasonCode': None, 'reasonDetail': None, 'metrics': {}},
+            'day': status.get('day') or {'day_key': None, 'rollover_in_effect': False, 'daily_consecutive_losses': 0, 'daily_realized_pnl': 0.0, 'daily_fees': 0.0, 'daily_trade_count': 0},
+            'dataset_path': dataset_path,
+        }
+        if partial_reasons:
+            payload['partial'] = True
+            payload['partial_reason'] = ','.join(partial_reasons)
+        _OVERVIEW_CACHE['payload'] = payload
+        _OVERVIEW_CACHE['ts'] = time.monotonic()
+        return payload
 
 
 @router.get('/events')
