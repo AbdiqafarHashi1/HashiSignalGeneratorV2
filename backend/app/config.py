@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     tp1_r_mult: float = 1.0
     tp2_r_mult: float = 1.8
     partial_pct: float = 0.5
+    tp1_be_enabled: bool = True
+    tp1_be_offset: float = 0.0
     atr_pct_min: float = 0.18
     htf_slope_lookback_bars: int = 8
     htf_slope_min_pct: float = 0.0020

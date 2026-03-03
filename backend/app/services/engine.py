@@ -610,7 +610,7 @@ class EngineService:
         ).scalar_one_or_none()
         if trade:
             self._open_trade_id_by_symbol[symbol] = trade.id
-            self._tp1_done_by_trade.setdefault(trade.id, False)
+            self._tp1_done_by_trade[trade.id] = bool(getattr(trade, 'tp1_be_armed', False))
         return trade
 
     async def _open_position(
@@ -650,6 +650,7 @@ class EngineService:
             stop_price=stop_price,
             tp1_price=tp1_price,
             tp2_price=tp2_price,
+            tp1_be_armed=False,
             time_stop_bars=int(plan.time_stop_bars),
             strategy_name=plan.strategy_name,
             strategy_profile=self.active_profile,
@@ -796,7 +797,7 @@ class EngineService:
         stop = Decimal(str(trade.stop_price or 0))
         tp1 = Decimal(str(trade.tp1_price or 0))
         tp2 = Decimal(str(trade.tp2_price or 0))
-        tp1_done = bool(self._tp1_done_by_trade.get(trade.id, False))
+        tp1_be_armed = bool(getattr(trade, 'tp1_be_armed', False) or self._tp1_done_by_trade.get(trade.id, False))
         bars_held = max(0, replay_clock - self._open_bar_by_symbol.get(trade.symbol, replay_clock))
         time_stop_limit = int(trade.time_stop_bars or settings.time_stop_bars)
 
@@ -828,18 +829,15 @@ class EngineService:
             return 'EXIT', 'sl_close', ['stop_loss_hit']
 
         if tp2_hit:
-            if (not growth_trade) and (not tp1_done) and tp1 > 0:
-                await self._partial_close(
+            if (not growth_trade) and settings.tp1_be_enabled and (not tp1_be_armed) and tp1 > 0:
+                tp1_be_armed = await self._arm_tp1_be(
                     db=db,
                     trade=trade,
+                    old_stop=stop,
+                    tp1_price=tp1,
+                    ts_ms=ts_ms,
                     position=position,
-                    close_price=tp1,
-                    close_ts_ms=ts_ms,
-                    reason='tp1_close',
-                    portion=settings.partial_pct,
                 )
-                tp1_done = True
-                self._tp1_done_by_trade[trade.id] = True
             await self._final_close(
                 db=db,
                 trade=trade,
@@ -853,18 +851,17 @@ class EngineService:
             )
             return 'EXIT', 'tp_close', ['tp2_hit']
 
-        if (not growth_trade) and tp1_hit and not tp1_done:
-            await self._partial_close(
+        if (not growth_trade) and tp1_hit and settings.tp1_be_enabled and not tp1_be_armed:
+            tp1_be_armed = await self._arm_tp1_be(
                 db=db,
                 trade=trade,
+                old_stop=stop,
+                tp1_price=tp1,
+                ts_ms=ts_ms,
                 position=position,
-                close_price=tp1,
-                close_ts_ms=ts_ms,
-                reason='tp1_close',
-                portion=settings.partial_pct,
             )
-            self._tp1_done_by_trade[trade.id] = True
-            return 'PARTIAL', 'tp1_close', ['tp1_hit']
+            if tp1_be_armed:
+                return 'HOLD', 'tp1_be_arm', ['tp1_hit', 'stop_moved_to_be']
 
         if (not growth_trade) and bars_held >= time_stop_limit:
             await self._final_close(
@@ -895,6 +892,45 @@ class EngineService:
             )
             return 'EXIT', 'signal_close', ['opposite_signal']
         return 'HOLD', 'manage_hold', ['hold_no_exit_trigger']
+
+    async def _arm_tp1_be(
+        self,
+        db: AsyncSession,
+        trade: Trade,
+        old_stop: Decimal,
+        tp1_price: Decimal,
+        ts_ms: int,
+        position: Position,
+    ) -> bool:
+        if tp1_price <= 0:
+            return False
+        offset = Decimal(str(settings.tp1_be_offset))
+        entry = Decimal(str(trade.entry_price))
+        new_stop = entry + offset if trade.side == 'BUY' else entry - offset
+        improves_safety = (new_stop > old_stop) if trade.side == 'BUY' else (new_stop < old_stop)
+        if not improves_safety:
+            return False
+
+        trade.stop_price = new_stop
+        trade.tp1_be_armed = True
+        self._tp1_done_by_trade[trade.id] = True
+        db.add(trade)
+
+        print(
+            f"[REPLAY] {trade.symbol} TP1_BE_ARM side={trade.side} old_sl={float(old_stop)} new_sl={float(new_stop)} entry={float(entry)} offset={float(offset)}"
+        )
+        await self._record_lifecycle_event(
+            event_type='POSITION_MANAGE_TICK',
+            timestamp=ts_ms,
+            symbol=trade.symbol,
+            trade=trade,
+            position=position,
+            action='HOLD',
+            primary_reason='tp1_be_arm',
+            reason_tags=['tp1_hit', 'stop_moved_to_be'],
+            mark_price=tp1_price,
+        )
+        return True
 
     def _build_blockers(self, *, plan: TradePlan, blockers: list[dict], position_open: bool, decision: str) -> list[str]:
         blocker_set = set(str(b.get('name')) for b in blockers if isinstance(b, dict) and b.get('name'))
