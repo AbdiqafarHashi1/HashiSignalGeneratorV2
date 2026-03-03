@@ -141,6 +141,22 @@ const toNum = (value: any): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
+const mergeOverviewState = (prev: any, incoming: any) => {
+  const base = prev && typeof prev === 'object' ? prev : {};
+  const next = incoming && typeof incoming === 'object' ? incoming : {};
+  return {
+    ...base,
+    ...next,
+    replay: { ...(base?.replay || {}), ...(next?.replay || {}) },
+    goal: { ...(base?.goal || {}), ...(next?.goal || {}) },
+    dd: { ...(base?.dd || {}), ...(next?.dd || {}) },
+    recon: { ...(base?.recon || {}), ...(next?.recon || {}) },
+    safety: { ...(base?.safety || {}), ...(next?.safety || {}) },
+    open_position: { ...(base?.open_position || {}), ...(next?.open_position || {}) },
+    latest_decision: { ...(base?.latest_decision || {}), ...(next?.latest_decision || {}) },
+  };
+};
+
 const computeAccountState = ({
   overview,
   trades,
@@ -330,7 +346,7 @@ export default function Page() {
     try {
       const res = await fetchOverview(5000);
       if (reqId !== overviewReqSeq.current) return;
-      setOverview(res || {});
+      setOverview((prev:any) => mergeOverviewState(prev, res || {}));
       markFetchMeta('overview', { lastOkAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastCount: null, lastErr: null });
       setError('');
       setLastRefreshAt(Date.now());
@@ -476,6 +492,15 @@ export default function Page() {
   const reconStaleMs = overview?.safety?.staleness_ms;
   const dayKey = text(overview?.day?.day_key);
   const rolloverInEffect = Boolean(overview?.day?.rollover_in_effect);
+
+  const equityStartVal = Number(overview?.equity_start || 0);
+  const equityNowVal = Number(overview?.equity_now ?? overview?.equity ?? 0);
+  const equityHighVal = Number(overview?.equity_high ?? overview?.dd?.hwm ?? Math.max(equityStartVal, equityNowVal));
+  const computedGoalPct = equityStartVal > 0 ? ((equityNowVal - equityStartVal) / equityStartVal) * 100 : 0;
+  const goalProgressPct = Number(overview?.goal?.progress_pct ?? computedGoalPct);
+  const goalTargetPct = Number(overview?.goal?.target_pct ?? 0);
+  const goalRatio = Math.max(0, Math.min(1, Number(overview?.goal?.progress_ratio ?? (goalTargetPct > 0 ? goalProgressPct / goalTargetPct : 0))));
+  const overviewPartial = Boolean(overview?.partial);
 
   const openPosition = positions[0] || null;
   const openTrade = useMemo(
@@ -787,15 +812,17 @@ export default function Page() {
       {error && <div className='rounded border border-rose-700 bg-rose-950/30 px-3 py-2 text-sm'>{error}</div>}
 
       <section className='grid grid-cols-2 lg:grid-cols-4 gap-3'>
+        {overviewPartial && <div className='col-span-2 lg:col-span-4 rounded border border-amber-700 bg-amber-950/20 px-3 py-2 text-xs text-amber-200'>partial/stale snapshot</div>}
         <div className='rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 py-3'><div className='text-[10px] uppercase tracking-wider text-zinc-400'>EQUITY NOW</div><div className='text-2xl font-semibold'>{fmtNum(overview?.equity_now ?? overview?.equity, 2)}</div></div>
         <div className='rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 py-3'><div className='text-[10px] uppercase tracking-wider text-zinc-400'>REALIZED NET</div><div className='text-2xl font-semibold'>{fmtNum(overview?.realized_pnl_net ?? overview?.realized_net, 2)}</div></div>
         <div className='rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 py-3'><div className='text-[10px] uppercase tracking-wider text-zinc-400'>UNREALIZED</div><div className={`text-2xl font-semibold ${Number(overview?.unrealized_pnl ?? overview?.unrealized) > 0 ? 'text-emerald-400' : Number(overview?.unrealized_pnl ?? overview?.unrealized) < 0 ? 'text-rose-400' : ''}`}>{fmtNum(overview?.unrealized_pnl ?? overview?.unrealized, 2)}</div></div>
         <div className='rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 py-3'><div className='text-[10px] uppercase tracking-wider text-zinc-400'>FEES TOTAL</div><div className='text-2xl font-semibold'>{fmtNum(overview?.fees_total, 2)}</div></div>
         <div className='rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 py-3'><div className='text-[10px] uppercase tracking-wider text-zinc-400'>GLOBAL DD%</div><div className='text-2xl font-semibold'>{fmtNum(overview?.dd?.global_dd_pct ?? overview?.global_dd_pct, 2)}</div></div>
+        <div className='rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 py-3'><div className='text-[10px] uppercase tracking-wider text-zinc-400'>HIGH / NOW</div><div className='text-sm font-semibold'>{fmtNum(equityHighVal, 2)} / {fmtNum(equityNowVal, 2)}</div></div>
         <div className='col-span-2 rounded-lg border border-zinc-800 bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 py-3'>
           <div className='text-[10px] uppercase tracking-wider text-zinc-400'>GOAL PROGRESS</div>
-          <div className='text-sm mt-1'>{fmtNum(overview?.goal?.progress_pct, 2)}% / {fmtNum(overview?.goal?.target_pct, 2)}%</div>
-          <div className='mt-2 grid grid-cols-20 gap-0.5'>{Array.from({ length: 20 }).map((_, i) => <div key={i} className={`h-1.5 rounded-[2px] ${i < Number(overview?.goal?.progress_ratio || 0) * 20 ? 'bg-zinc-200' : 'bg-zinc-800'}`} />)}</div>
+          <div className='text-sm mt-1'>{fmtNum(goalProgressPct, 2)}% / {fmtNum(goalTargetPct, 2)}%</div>
+          <div className='mt-2 grid grid-cols-20 gap-0.5'>{Array.from({ length: 20 }).map((_, i) => <div key={i} className={`h-1.5 rounded-[2px] ${i < goalRatio * 20 ? 'bg-zinc-200' : 'bg-zinc-800'}`} />)}</div>
         </div>
       </section>
 
@@ -885,7 +912,8 @@ export default function Page() {
                 </div>
                 <div>Entry {fmtNum(displayPosition?.entry_price, 2)}</div>
                 <div>Qty {fmtNum(displayPosition?.quantity, 4)}</div>
-                <div>SL {fmtNum(displayOpenTrade?.stop_price, 2)}</div>
+                <div>SL {fmtNum(displayOpenTrade?.stop_price ?? overview?.open_position?.sl, 2)}</div>
+                <div>BE {overview?.open_position?.be_armed ? 'ARMED' : 'NO'}</div>
                 <div>TP1 {fmtNum(displayOpenTrade?.tp1_price, 2)}</div>
                 <div>TP2 {fmtNum(displayOpenTrade?.tp2_price, 2)}</div>
                 <div>Bars/TimeStop {text(displayOpenTrade?.bars_held)} / {text(displayOpenTrade?.time_stop_bars)}</div>

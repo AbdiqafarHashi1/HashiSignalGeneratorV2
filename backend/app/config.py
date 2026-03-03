@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     telegram_enabled: str = ''
     telegram_status_interval_min: int = 60
     telegram_no_trade_interval_min: int = 30
+    telegram_notify_level: str = 'all'
+    telegram_digest_every_min: int = 60
+    telegram_max_msg_per_min: int = 20
     data_dir: str = '/data'
     equity_start: float = 100000.0
     monthly_target_pct: float = 6.0
@@ -47,6 +50,9 @@ class Settings(BaseSettings):
     tp1_r_mult: float = 1.0
     tp2_r_mult: float = 1.8
     partial_pct: float = 0.5
+    tp1_be_enabled: bool = False
+    tp1_be_offset: float = 0.0
+    tp1_detection_mode: str = 'touch'
     atr_pct_min: float = 0.18
     htf_slope_lookback_bars: int = 8
     htf_slope_min_pct: float = 0.0020

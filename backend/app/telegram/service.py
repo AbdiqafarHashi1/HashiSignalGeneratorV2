@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from collections import deque
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,12 @@ class TelegramService:
         self.enabled = (enabled_cfg in {'1', 'true', 'yes'}) if enabled_cfg else bool(self.bot_token and self.chat_id)
         self.status_interval_min = int(getattr(settings, 'telegram_status_interval_min', 60) or 60)
         self.no_trade_interval_min = int(getattr(settings, 'telegram_no_trade_interval_min', 30) or 30)
+        self.notify_level = str(getattr(settings, 'telegram_notify_level', 'all') or 'all').lower()
+        self.digest_every_min = max(1, int(getattr(settings, 'telegram_digest_every_min', 60) or 60))
+        self.max_msg_per_min = max(1, int(getattr(settings, 'telegram_max_msg_per_min', 20) or 20))
+        self._send_timestamps: deque[datetime] = deque()
+        self._suppressed_count = 0
+        self._last_digest_at: datetime | None = None
         self._last_status_at: datetime | None = None
         self._last_no_trade_at: datetime | None = None
         self._last_blocker: str | None = None
@@ -62,6 +69,50 @@ class TelegramService:
 
     async def send_risk_alert(self, db: AsyncSession, body: str) -> dict:
         return await self._send(db, 'risk', body)
+
+    def _level_allowed(self, category: str) -> bool:
+        if self.notify_level == 'all':
+            return True
+        if self.notify_level == 'trades':
+            return category in {'entry', 'exit', 'risk_update', 'digest'}
+        if self.notify_level == 'signals':
+            return category in {'signal', 'digest'}
+        return True
+
+    def _within_rate_limit(self, now: datetime) -> bool:
+        while self._send_timestamps and (now - self._send_timestamps[0]).total_seconds() >= 60:
+            self._send_timestamps.popleft()
+        if len(self._send_timestamps) >= self.max_msg_per_min:
+            self._suppressed_count += 1
+            return False
+        self._send_timestamps.append(now)
+        return True
+
+    def notify_event(self, category: str, body: str) -> bool:
+        if not self.enabled or not self._level_allowed(category):
+            return False
+        now = datetime.now(timezone.utc)
+        if not self._within_rate_limit(now):
+            return False
+        self.notify(body)
+        return True
+
+    def should_send_digest(self, now: datetime | None = None) -> bool:
+        if not self.enabled:
+            return False
+        current = now or datetime.now(timezone.utc)
+        if not self._last_digest_at:
+            self._last_digest_at = current
+            return True
+        if (current - self._last_digest_at).total_seconds() >= self.digest_every_min * 60:
+            self._last_digest_at = current
+            return True
+        return False
+
+    def consume_suppressed_count(self) -> int:
+        value = self._suppressed_count
+        self._suppressed_count = 0
+        return value
 
 
     def notify(self, body: str) -> None:

@@ -52,6 +52,7 @@ class EngineService:
         self._open_trade_id_by_symbol: dict[str, UUID] = {}
         self._open_bar_by_symbol: dict[str, int] = {}
         self._tp1_done_by_trade: dict[UUID, bool] = {}
+        self._be_armed_by_trade: dict[UUID, bool] = {}
         self._history_by_symbol: dict[str, list[dict]] = {}
         self.governor = GovernorService(redis_client=self.redis)
         self.safety = SafetyService()
@@ -147,6 +148,7 @@ class EngineService:
         self._open_trade_id_by_symbol.clear()
         self._open_bar_by_symbol.clear()
         self._tp1_done_by_trade.clear()
+        self._be_armed_by_trade.clear()
         self._history_by_symbol.clear()
         self._decision_traces.clear()
         self._lifecycle_events.clear()
@@ -206,6 +208,7 @@ class EngineService:
         self._open_trade_id_by_symbol.clear()
         self._open_bar_by_symbol.clear()
         self._tp1_done_by_trade.clear()
+        self._be_armed_by_trade.clear()
         self._history_by_symbol.clear()
         self._decision_traces.clear()
         self._print_lifecycle_diagnostics()
@@ -357,13 +360,8 @@ class EngineService:
                         evidence=runtime.evidence,
                     )
             await self._publish_state()
-            if self.telegram.should_send_status():
-                st = self.status()
-                self.telegram.notify(
-                    f"[{str(st.get('mode','live')).upper()}] {self.replay_symbol} {self.active_profile} "
-                    f"equity={st.get('risk',{}).get('equity')} dd={st.get('risk',{}).get('global_drawdown_pct')}% "
-                    f"pretrade={'OK' if st.get('pre_trade_decision',{}).get('allowed', True) else st.get('pre_trade_decision',{}).get('reasonCode')}"
-                )
+            if self.telegram.should_send_digest():
+                await self._send_hourly_digest()
             await asyncio.sleep(0.5)
 
     async def _next_tick(self, force_step: bool = False) -> dict | None:
@@ -592,15 +590,21 @@ class EngineService:
             )
             self._record_decision_trace(trace)
 
+            final_decision = decision.upper() if decision != 'hold' else 'HOLD'
             await self._record_decision_event(
                 db=db,
                 ts_ms=ts_ms,
                 symbol=symbol,
-                decision=decision.upper() if decision != 'hold' else 'HOLD',
+                decision=final_decision,
                 plan=plan,
                 blockers=blockers,
                 extra_blockers=plan.blockers,
                 rationale=rationale,
+            )
+            allowed_label = 'allowed' if final_decision != 'BLOCKED' else 'blocked'
+            self.telegram.notify_event(
+                'signal',
+                f"[REPLAY] SIGNAL {symbol} side={plan.side or '-'} regime={plan.regime} decision={final_decision} {allowed_label} reasons={','.join((plan.reasons or [])[:3]) or '-'} blockers={','.join([str(b.get('name')) for b in blockers[:3]]) if blockers else '-'}",
             )
             await db.commit()
 
@@ -611,6 +615,7 @@ class EngineService:
         if trade:
             self._open_trade_id_by_symbol[symbol] = trade.id
             self._tp1_done_by_trade.setdefault(trade.id, False)
+            self._be_armed_by_trade.setdefault(trade.id, False)
         return trade
 
     async def _open_position(
@@ -694,6 +699,7 @@ class EngineService:
         self._open_trade_id_by_symbol[symbol] = trade.id
         self._open_bar_by_symbol[symbol] = replay_clock
         self._tp1_done_by_trade[trade.id] = False
+        self._be_armed_by_trade[trade.id] = False
         self.daily_state['daily_trade_count'] = int(self.daily_state.get('daily_trade_count', 0)) + 1
         await self._record_lifecycle_event(
             event_type='ORDER_CREATED',
@@ -774,10 +780,21 @@ class EngineService:
                 'R_multiple': plan.r_multiple,
             },
         )
-        self.telegram.notify(
-            f"[REPLAY] {symbol} {self.active_profile} ENTRY {side} qty={float(qty):.4f} entry={float(entry_price):.4f} "
-            f"sl={float(stop_price) if stop_price is not None else '-'} tp={float(tp2_price) if tp2_price is not None else float(tp1_price) if tp1_price is not None else '-'} "
-            f"risk_pct={plan.risk_pct_used if plan.risk_pct_used is not None else '-'}"
+        self.telegram.notify_event(
+            'entry',
+            f"[REPLAY] ENTRY {symbol} {side} qty={float(qty):.4f} entry={float(entry_price):.4f} sl={float(stop_price) if stop_price is not None else '-'} tp1={float(tp1_price) if tp1_price is not None else '-'} tp2={float(tp2_price) if tp2_price is not None else '-'} risk_pct={plan.risk_pct_used if plan.risk_pct_used is not None else '-'} reasons={','.join((plan.reasons or [])[:3])}"
+        )
+
+    async def _send_hourly_digest(self) -> None:
+        st = self.status()
+        blockers = []
+        gov = st.get('governor') if isinstance(st.get('governor'), dict) else {}
+        if isinstance(gov, dict):
+            blockers = [str(b.get('reason')) for b in (gov.get('blockers') or [])[:3]]
+        suppressed = self.telegram.consume_suppressed_count()
+        self.telegram.notify_event(
+            'digest',
+            f"[DIGEST] equity={st.get('risk',{}).get('equity')} realized={self.daily_state.get('daily_realized_pnl', 0.0):.2f} unrealized=0 open={len(self._open_trade_id_by_symbol)} recon={st.get('safety',{}).get('reconciler',{}).get('status','ok')} blockers={','.join(blockers) if blockers else '-'} trades_today={self.daily_state.get('daily_trade_count', 0)} loss_streak={self.daily_state.get('daily_consecutive_losses', 0)} collapsed={suppressed}"
         )
 
     async def _evaluate_open_trade(
@@ -801,16 +818,19 @@ class EngineService:
         time_stop_limit = int(trade.time_stop_bars or settings.time_stop_bars)
 
         growth_trade = str(trade.strategy_profile or '').upper() == 'GROWTH_HUNTER'
+        detect_mode = str(getattr(settings, 'tp1_detection_mode', 'touch') or 'touch').lower()
         stop_hit = False
         tp1_hit = False
         tp2_hit = False
         if trade.side == 'BUY':
             stop_hit = low <= stop if stop > 0 else False
-            tp1_hit = (not growth_trade) and (high >= tp1 if tp1 > 0 else False)
+            if tp1 > 0:
+                tp1_hit = close >= tp1 if detect_mode == 'close' else high >= tp1
             tp2_hit = high >= tp2 if tp2 > 0 else False
         else:
             stop_hit = high >= stop if stop > 0 else False
-            tp1_hit = (not growth_trade) and (low <= tp1 if tp1 > 0 else False)
+            if tp1 > 0:
+                tp1_hit = close <= tp1 if detect_mode == 'close' else low <= tp1
             tp2_hit = low <= tp2 if tp2 > 0 else False
 
         if stop_hit:
@@ -828,18 +848,7 @@ class EngineService:
             return 'EXIT', 'sl_close', ['stop_loss_hit']
 
         if tp2_hit:
-            if (not growth_trade) and (not tp1_done) and tp1 > 0:
-                await self._partial_close(
-                    db=db,
-                    trade=trade,
-                    position=position,
-                    close_price=tp1,
-                    close_ts_ms=ts_ms,
-                    reason='tp1_close',
-                    portion=settings.partial_pct,
-                )
-                tp1_done = True
-                self._tp1_done_by_trade[trade.id] = True
+            await self._maybe_move_stop_to_be(db=db, trade=trade, position=position, price=close, ts_ms=ts_ms)
             await self._final_close(
                 db=db,
                 trade=trade,
@@ -853,18 +862,10 @@ class EngineService:
             )
             return 'EXIT', 'tp_close', ['tp2_hit']
 
-        if (not growth_trade) and tp1_hit and not tp1_done:
-            await self._partial_close(
-                db=db,
-                trade=trade,
-                position=position,
-                close_price=tp1,
-                close_ts_ms=ts_ms,
-                reason='tp1_close',
-                portion=settings.partial_pct,
-            )
+        if tp1_hit and not tp1_done:
+            moved = await self._maybe_move_stop_to_be(db=db, trade=trade, position=position, price=close, ts_ms=ts_ms)
             self._tp1_done_by_trade[trade.id] = True
-            return 'PARTIAL', 'tp1_close', ['tp1_hit']
+            return 'RISK_UPDATE', 'tp1_to_be' if moved else 'tp1_seen', ['tp1_hit']
 
         if (not growth_trade) and bars_held >= time_stop_limit:
             await self._final_close(
@@ -1217,6 +1218,42 @@ class EngineService:
             'pass_rate_outside_streak_pct': (pass_out / len(outside) * 100.0) if outside else None,
         }
 
+    async def _maybe_move_stop_to_be(self, db: AsyncSession, trade: Trade, position: Position, price: Decimal, ts_ms: int) -> bool:
+        if not bool(getattr(settings, 'tp1_be_enabled', False)):
+            return False
+        entry = Decimal(str(trade.entry_price or 0))
+        old_sl = Decimal(str(trade.stop_price or 0))
+        if entry <= 0 or old_sl <= 0:
+            return False
+        offset = abs(Decimal(str(getattr(settings, 'tp1_be_offset', 0.0) or 0.0)))
+        target = entry + offset if trade.side == 'BUY' else entry - offset
+        if trade.side == 'BUY':
+            new_sl = max(old_sl, target)
+        else:
+            new_sl = min(old_sl, target)
+        if new_sl == old_sl:
+            return False
+        trade.stop_price = new_sl
+        await self._emit_trade_event(
+            db=db,
+            ts_ms=ts_ms,
+            symbol=trade.symbol,
+            decision='RISK_UPDATE',
+            reason='tp1_to_be',
+            trade=trade,
+            position=position,
+            side=trade.side,
+            qty=Decimal(str(trade.quantity or 0)),
+            price=price,
+            fee_delta=Decimal('0'),
+            extra={'old_sl': float(old_sl), 'new_sl': float(new_sl)},
+        )
+        self.telegram.notify_event(
+            'risk_update',
+            f"[REPLAY] {trade.symbol} {self.active_profile} RISK_UPDATE tp1_to_be old_sl={float(old_sl):.4f} new_sl={float(new_sl):.4f} price={float(price):.4f}",
+        )
+        return True
+
     async def _partial_close(
         self,
         db: AsyncSession,
@@ -1374,6 +1411,7 @@ class EngineService:
         self._open_trade_id_by_symbol.pop(symbol, None)
         self._open_bar_by_symbol.pop(symbol, None)
         self._tp1_done_by_trade.pop(trade.id, None)
+        self._be_armed_by_trade.pop(trade.id, None)
 
         await self._record_lifecycle_event(
             event_type='EXIT_SIGNALLED',
@@ -1422,9 +1460,9 @@ class EngineService:
             },
         )
 
-        self.telegram.notify(
-            f"[REPLAY] {symbol} {self.active_profile} EXIT reason={reason} pnl_net={float(pnl_net):.4f} fees={float(fees_total):.4f} "
-            f"equity={float(settings.equity_start) + float(self.daily_state.get('daily_realized_pnl', 0.0)):.2f}"
+        self.telegram.notify_event(
+            'exit',
+            f"[REPLAY] EXIT {symbol} reason={reason} pnl_net={float(pnl_net):.4f} fees={float(fees_total):.4f} equity={float(settings.equity_start) + float(self.daily_state.get('daily_realized_pnl', 0.0)):.2f}"
         )
 
     async def _emit_trade_event(
