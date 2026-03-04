@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     partial_pct: float = 0.5
     tp1_be_enabled: bool = True
     tp1_be_offset: float = 0.0
+    instant_backtest_enabled: bool = False
     atr_pct_min: float = 0.18
     htf_slope_lookback_bars: int = 8
     htf_slope_min_pct: float = 0.0020

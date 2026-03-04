@@ -7,6 +7,9 @@ import TradeTable from '../components/TradeTable';
 import {
   apiBaseUrl,
   controlSetProfile,
+  backtestResult,
+  backtestRun,
+  backtestStatus,
   fetchDatasets,
   fetchEvents,
   fetchOverview,
@@ -290,6 +293,11 @@ export default function Page() {
   const overviewInFlightRef = useRef(false);
   const controlInFlightRef = useRef(false);
   const [overviewBackoffMs, setOverviewBackoffMs] = useState(500);
+  const [dashboardMode, setDashboardMode] = useState<'REPLAY' | 'BACKTEST'>('REPLAY');
+  const [backtestRunId, setBacktestRunId] = useState('');
+  const [backtestStatusState, setBacktestStatusState] = useState<any>(null);
+  const [backtestResultData, setBacktestResultData] = useState<any>(null);
+  const [backtestRunning, setBacktestRunning] = useState(false);
 
   const isRunning = Boolean(overview?.replay?.is_running);
   const ageLabel = (ts: number | null) => (ts ? `${Math.max(0, uiNowMs - ts)} ms ago` : '-');
@@ -453,8 +461,8 @@ export default function Page() {
     void loadDatasets();
   }, [loadDatasets]);
 
-  usePollingLoop(() => loadOverview(), () => (isRunningRef.current ? Math.max(500, overviewBackoffMs) : Math.max(1000, overviewBackoffMs)));
-  usePollingLoop(() => loadStreams(), () => (isRunningRef.current ? 1200 : 3500));
+  usePollingLoop(() => loadOverview(), () => (dashboardMode === 'BACKTEST' ? 5000 : (isRunningRef.current ? Math.max(500, overviewBackoffMs) : Math.max(1000, overviewBackoffMs))));
+  usePollingLoop(() => (dashboardMode === 'BACKTEST' ? Promise.resolve() : loadStreams()), () => (dashboardMode === 'BACKTEST' ? 7000 : (isRunningRef.current ? 1200 : 3500)));
 
   useEffect(() => {
     if (!toast) return;
@@ -643,6 +651,52 @@ export default function Page() {
     }
   }, [loadOverview, loadStreams]);
 
+
+  const runBacktest = useCallback(async () => {
+    try {
+      setBacktestResultData(null);
+      const payload = selectedDatasetId
+        ? { dataset_id: selectedDatasetId, profile }
+        : { dataset_path: DEFAULT_REPLAY_DATASET, profile };
+      const res = await backtestRun(payload);
+      const runId = String(res?.run_id || '');
+      if (!runId) throw new Error('No run_id returned by /backtest/run');
+      setBacktestRunId(runId);
+      setBacktestRunning(true);
+      setBacktestStatusState({ state: 'running', progress_pct: 0, message: 'started' });
+    } catch (e: any) {
+      setError(errorText(e));
+    }
+  }, [selectedDatasetId, profile]);
+
+  useEffect(() => {
+    if (dashboardMode !== 'BACKTEST' || !backtestRunId) return;
+    let stop = false;
+    const tick = async () => {
+      try {
+        const st = await backtestStatus(backtestRunId);
+        if (stop) return;
+        setBacktestStatusState(st);
+        const running = String(st?.state || '').toLowerCase() === 'running';
+        setBacktestRunning(running);
+        if (String(st?.state || '').toLowerCase() === 'done') {
+          const result = await backtestResult(backtestRunId);
+          if (!stop) setBacktestResultData(result);
+        }
+      } catch (e: any) {
+        if (!stop) {
+          setBacktestRunning(false);
+          setError(errorText(e));
+        }
+      }
+      if (!stop && backtestRunning) setTimeout(tick, 900);
+    };
+    void tick();
+    return () => {
+      stop = true;
+    };
+  }, [dashboardMode, backtestRunId, backtestRunning]);
+
   const handleUpload = async (file: File) => {
     try {
       const res = await uploadDataset(file);
@@ -670,6 +724,10 @@ export default function Page() {
             </select>
             <span className='inline-flex h-8 items-center rounded border border-zinc-700 bg-zinc-900 px-2.5'>Clock {text(clock)}</span>
             <span className='inline-flex h-8 items-center rounded border border-zinc-700 bg-zinc-900 px-2.5'>Ptr {text(pointer)}</span>
+            <div className='inline-flex h-8 items-center rounded border border-zinc-700 bg-zinc-900 p-0.5'>
+              <button className={`px-2.5 py-1 rounded ${dashboardMode === 'REPLAY' ? 'bg-cyan-900/50 text-cyan-200' : ''}`} onClick={() => setDashboardMode('REPLAY')}>Replay</button>
+              <button className={`px-2.5 py-1 rounded ${dashboardMode === 'BACKTEST' ? 'bg-cyan-900/50 text-cyan-200' : ''}`} onClick={() => setDashboardMode('BACKTEST')}>Backtest</button>
+            </div>
             <span className='inline-flex h-8 items-center rounded border border-zinc-700 bg-zinc-900 px-2.5'>API {apiBaseUrl}</span>
           </div>
 
@@ -694,6 +752,9 @@ export default function Page() {
                 <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => performControl(() => replayStep())}>Step</button>
                 <button className='h-9 rounded border border-rose-700 bg-rose-950/30 px-3 text-sm text-rose-200' onClick={() => performControl(() => replayStop())}>Stop</button>
                 <button className='h-9 rounded border border-rose-800 bg-rose-950/20 px-3 text-sm text-rose-100' onClick={() => performControl(() => replayReset())}>Reset</button>
+                {dashboardMode === 'BACKTEST' && (
+                  <button className='h-9 rounded border border-emerald-700 bg-emerald-950/30 px-3 text-sm text-emerald-200' onClick={() => void runBacktest()}>Run Backtest</button>
+                )}
                 <div className='flex h-9 items-center gap-2 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm'>
                   <span>Speed</span>
                   <input type='range' min='1' max='10' value={Math.round(speed)} onChange={(e) => setSpeed(Number(e.target.value) || 1)} />
@@ -991,11 +1052,27 @@ export default function Page() {
 
       <section className='space-y-4'>
         <div className='rounded-lg border border-zinc-800 bg-zinc-950 p-4 min-w-0 w-full'>
-          <h2 className='text-lg font-semibold mb-2'>Trade Log</h2>
-          <div className='text-[11px] text-zinc-500 mb-2'>Trades: {trades.length} (rawShape={tradesRawShape}) | last {ageLabel(fetchMeta.trades.lastOkAt)}</div>
-          {trades.length ? <TradeTable items={trades} /> : <div className='text-sm text-zinc-500'>No trades returned by API. count: {trades.length}</div>}
+          <h2 className='text-lg font-semibold mb-2'>{dashboardMode === 'BACKTEST' ? 'Backtest Trades' : 'Trade Log'}</h2>
+          <div className='text-[11px] text-zinc-500 mb-2'>
+            {dashboardMode === 'BACKTEST'
+              ? `Run ${backtestRunId || '-'} | state ${backtestStatusState?.state || 'idle'} | progress ${backtestStatusState?.progress_pct ?? 0}%`
+              : `Trades: ${trades.length} (rawShape=${tradesRawShape}) | last ${ageLabel(fetchMeta.trades.lastOkAt)}`}
+          </div>
+          {dashboardMode === 'BACKTEST' && backtestResultData?.summary && (
+            <div className='mb-3 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs'>
+              <div className='rounded border border-zinc-800 p-2'>Win rate {fmtNum(backtestResultData.summary.win_rate, 2)}%</div>
+              <div className='rounded border border-zinc-800 p-2'>Profit factor {fmtNum(backtestResultData.summary.profit_factor, 2)}</div>
+              <div className='rounded border border-zinc-800 p-2'>Expectancy {fmtNum(backtestResultData.summary.expectancy, 2)}</div>
+              <div className='rounded border border-zinc-800 p-2'>Max DD {fmtNum(backtestResultData.summary.max_dd, 2)}%</div>
+              <div className='rounded border border-zinc-800 p-2'>Avg win {fmtNum(backtestResultData.summary.avg_win, 2)}</div>
+              <div className='rounded border border-zinc-800 p-2'>Avg loss {fmtNum(backtestResultData.summary.avg_loss, 2)}</div>
+              <div className='rounded border border-zinc-800 p-2'>Fees {fmtNum(backtestResultData.summary.fees_total, 2)}</div>
+              <div className='rounded border border-zinc-800 p-2'>Trades {fmtNum(backtestResultData.summary.trades_count, 0)}</div>
+            </div>
+          )}
+          {(dashboardMode === 'BACKTEST' ? (backtestResultData?.trades || []) : trades).length ? <TradeTable items={dashboardMode === 'BACKTEST' ? (backtestResultData?.trades || []) : trades} /> : <div className='text-sm text-zinc-500'>No trades returned by API.</div>}
         </div>
-        <div className='rounded-lg border border-zinc-800 bg-zinc-950 p-4 min-w-0'>
+        {dashboardMode === 'REPLAY' && <div className='rounded-lg border border-zinc-800 bg-zinc-950 p-4 min-w-0'>
           <div className='flex flex-wrap items-center justify-between gap-2 mb-2'>
             <h2 className='text-lg font-semibold'>Event Tape</h2>
             <div className='text-[11px] text-zinc-500'>Events: {events.length} (rawShape={eventsRawShape}) | last {ageLabel(fetchMeta.events.lastOkAt)}</div>
@@ -1014,7 +1091,7 @@ export default function Page() {
               <pre className='max-w-full overflow-x-auto whitespace-pre-wrap break-words font-mono'>{JSON.stringify(selectedEvent?.risk_state_snapshot || selectedEvent, null, 2)}</pre>
             </div>
           )}
-        </div>
+        </div>}
       </section>
     </main>
   );

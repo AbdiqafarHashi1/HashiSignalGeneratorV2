@@ -31,7 +31,7 @@ services:
     build:
       context: ./backend
     env_file:
-      - .env
+      - ${COMPOSE_ENV_FILE:-.env}
     ports:
       - "8000:8000"
     volumes:

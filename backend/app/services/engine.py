@@ -907,7 +907,7 @@ class EngineService:
         offset = Decimal(str(settings.tp1_be_offset))
         entry = Decimal(str(trade.entry_price))
         new_stop = entry + offset if trade.side == 'BUY' else entry - offset
-        improves_safety = (new_stop > old_stop) if trade.side == 'BUY' else (new_stop < old_stop)
+        improves_safety = (new_stop >= old_stop) if trade.side == 'BUY' else (new_stop <= old_stop)
         if not improves_safety:
             return False
 
@@ -917,7 +917,7 @@ class EngineService:
         db.add(trade)
 
         print(
-            f"[REPLAY] {trade.symbol} TP1_BE_ARM side={trade.side} old_sl={float(old_stop)} new_sl={float(new_stop)} entry={float(entry)} offset={float(offset)}"
+            f"RISK_UPDATE {{reason: tp1_to_be, symbol: {trade.symbol}, side: {trade.side}, old_sl: {float(old_stop)}, new_sl: {float(new_stop)}, price: {float(tp1_price)}}}"
         )
         await self._record_lifecycle_event(
             event_type='POSITION_MANAGE_TICK',

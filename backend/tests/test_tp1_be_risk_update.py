@@ -119,3 +119,46 @@ async def test_tp1_hit_arms_be_and_skips_partial_close(monkeypatch):
     assert 'stop_moved_to_be' in tags
     assert trade.stop_price == Decimal('100')
     assert trade.tp1_be_armed is True
+
+
+@pytest.mark.asyncio
+async def test_tp1_be_respects_short_never_loosen(monkeypatch):
+    engine = EngineService(redis_client=FakeRedis())
+    db = FakeDB()
+
+    trade = Trade(
+        id=uuid4(),
+        symbol='ETHUSDT',
+        side='SELL',
+        quantity=Decimal('1'),
+        entry_price=Decimal('100'),
+        stop_price=Decimal('99'),
+        tp1_price=Decimal('99'),
+        tp2_price=Decimal('90'),
+        strategy_profile='TREND_STABLE',
+        status='OPEN',
+        tp1_be_armed=False,
+    )
+    position = Position(symbol='ETHUSDT', side='SELL', quantity=Decimal('1'), average_price=Decimal('100'), unrealized_pnl=Decimal('0'), is_open=True)
+
+    monkeypatch.setattr('app.services.engine.settings.tp1_be_enabled', True)
+    monkeypatch.setattr('app.services.engine.settings.tp1_be_offset', 2.0)
+
+    action, reason, tags = await engine._evaluate_open_trade(
+        db=db,
+        trade=trade,
+        position=position,
+        high=Decimal('100.5'),
+        low=Decimal('98.5'),
+        close=Decimal('99.2'),
+        ts_ms=1,
+        ts_dt=datetime.now(timezone.utc),
+        replay_clock=10,
+        plan=_plan(),
+    )
+
+    assert action == 'HOLD'
+    assert reason == 'manage_hold'
+    assert 'hold_no_exit_trigger' in tags
+    assert trade.stop_price == Decimal('99')
+    assert trade.tp1_be_armed is False

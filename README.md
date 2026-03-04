@@ -246,3 +246,72 @@ Response includes:
 python backend/scripts/smoke_replay_observability.py
 ```
 This runs a deterministic replay window (target 30 days for `ETHUSDT_15m`) and prints summary/top blockers/trade count/longest no-entry streak.
+
+## Instant Backtest Mode (Dashboard)
+1. Enable with env flag (default OFF): `INSTANT_BACKTEST_ENABLED=true`.
+2. Open dashboard and switch mode toggle to `Backtest`.
+3. Select/upload dataset, then click **Run Backtest**.
+4. Watch progress from `/backtest/status` and results load from `/backtest/result`.
+
+API:
+- `POST /backtest/run` -> `{ run_id }`
+- `GET /backtest/status?run_id=...` -> `{ state, progress_pct, message }`
+- `GET /backtest/result?run_id=...` -> `{ summary, trades, equity_curve }`
+
+Summary fields:
+- `win_rate`: winning trades / closed trades (%).
+- `profit_factor`: gross wins / abs(gross losses).
+- `expectancy`: average net pnl per closed trade.
+- `avg_win` / `avg_loss`: average net pnl over winning/losing trades.
+- `max_dd`: peak-to-trough drawdown percent on sampled equity curve.
+- `fees_total`: cumulative entry+exit fees.
+- `trades_count`: number of closed trades.
+
+Risk update behavior:
+- TP1 no longer triggers partial close.
+- TP1 hit now arms stop to breakeven (`entry +/- TP1_BE_OFFSET`) without loosening risk:
+  - LONG: `new_sl >= old_sl`
+  - SHORT: `new_sl <= old_sl`
+- Replay emits `RISK_UPDATE {reason: tp1_to_be, old_sl, new_sl, price}` marker.
+
+## Env Presets: Replay vs Instant Backtest (same strategy)
+Use these exact commands:
+
+```bash
+docker compose --env-file .env.replay up --build
+```
+
+```bash
+docker compose --env-file .env.instant up --build
+```
+
+Notes:
+- `docker-compose.yml` reads `COMPOSE_ENV_FILE` so the selected preset file is also used as the API container env file.
+- Both presets keep the same swing strategy/profile/symbol defaults and TP1->BE settings.
+
+## Sanity Check (quick)
+1. Start replay preset:
+```bash
+docker compose --env-file .env.replay up --build
+```
+2. Open dashboard (`http://localhost:3000`) and verify replay controls still work (start/pause/resume/step).
+3. Confirm API replay status:
+```bash
+curl -s http://localhost:8000/replay/status
+```
+
+4. Start instant preset:
+```bash
+docker compose --env-file .env.instant up --build
+```
+5. Run instant backtest endpoints:
+```bash
+curl -s -X POST http://localhost:8000/backtest/run \
+  -H 'Content-Type: application/json' \
+  -d '{"dataset_path":"data/datasets/ETHUSDT_15m.csv","profile":"TREND_STABLE"}'
+```
+6. Use returned `run_id`:
+```bash
+curl -s "http://localhost:8000/backtest/status?run_id=<run_id>"
+curl -s "http://localhost:8000/backtest/result?run_id=<run_id>"
+```
