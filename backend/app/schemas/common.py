@@ -25,6 +25,20 @@ class ReplayStartRequest(BaseModel):
     resume: bool = False
 
 
+
+
+class BacktestRunRequest(BaseModel):
+    dataset_path: str | None = None
+    dataset_id: UUID | None = None
+    profile: str | None = None
+    symbols: list[str] = Field(default_factory=list)
+    start: datetime | None = None
+    end: datetime | None = None
+    seed: int | None = None
+    timeframe: str | None = None
+    equity_sample_every: int | None = Field(default=25, ge=1, le=5000)
+
+
 class TradeRead(BaseModel):
     id: UUID
     symbol: str

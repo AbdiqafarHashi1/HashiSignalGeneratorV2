@@ -217,3 +217,8 @@ export const fetchSafetyIncident = async (incidentId: string) =>
   get(`/api/safety/incidents/${encodeURIComponent(incidentId)}`, { _ts: Date.now() });
 
 export const fetchReplayObservability = async (n = 200) => get("/replay/observability", { n, _ts: Date.now() });
+
+
+export const backtestRun = async (payload: any) => post("/backtest/run", payload);
+export const backtestStatus = async (run_id: string) => get("/backtest/status", { run_id, _ts: Date.now() });
+export const backtestResult = async (run_id: string) => get("/backtest/result", { run_id, _ts: Date.now() });

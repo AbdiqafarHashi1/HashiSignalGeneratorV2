@@ -11,12 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db.session import get_db
-from app.dependencies import get_engine_service
+from app.dependencies import get_engine_service, get_instant_backtest_service
 from app.models.entities import DecisionEvent, Execution, Position, ReplayDataset, Trade
-from app.schemas.common import ReplayStartRequest
+from app.schemas.common import BacktestRunRequest, ReplayStartRequest
 from app.services.accounting import PortfolioAccounting
 from app.services.datasets import persist_upload
 from app.services.engine import EngineService
+from app.services.instant_backtest import InstantBacktestService
 from app.services.governor import GovernorService
 from app.telegram.service import TelegramService
 
@@ -146,6 +147,60 @@ async def control_set_profile(
 @router.get('/replay/status')
 async def replay_status(engine: EngineService = Depends(get_engine_service)) -> dict:
     return engine.replay_status()
+
+@router.post('/backtest/run')
+async def backtest_run(
+    body: BacktestRunRequest,
+    engine: EngineService = Depends(get_engine_service),
+    backtest: InstantBacktestService = Depends(get_instant_backtest_service),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    dataset_path = body.dataset_path
+    if body.dataset_id:
+        dataset = await db.get(ReplayDataset, body.dataset_id)
+        if not dataset:
+            raise HTTPException(status_code=400, detail='dataset_id not found')
+        dataset_path = dataset.stored_path
+    if not dataset_path:
+        dataset_path = await engine.resolve_replay_dataset_path(dataset_id=None)
+    try:
+        run_id = await backtest.run(
+            {
+                'dataset_path': dataset_path,
+                'profile': body.profile,
+                'symbols': body.symbols,
+                'start': body.start.isoformat() if body.start else None,
+                'end': body.end.isoformat() if body.end else None,
+                'seed': body.seed,
+                'timeframe': body.timeframe,
+                'equity_sample_every': body.equity_sample_every,
+            }
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Unable to start backtest: {exc}') from exc
+    return {'run_id': run_id}
+
+
+@router.get('/backtest/status')
+async def backtest_status(
+    run_id: str = Query(..., min_length=3),
+    backtest: InstantBacktestService = Depends(get_instant_backtest_service),
+) -> dict:
+    return await backtest.status(run_id=run_id)
+
+
+@router.get('/backtest/result')
+async def backtest_result(
+    run_id: str = Query(..., min_length=3),
+    backtest: InstantBacktestService = Depends(get_instant_backtest_service),
+) -> dict:
+    try:
+        return await backtest.result(run_id=run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 
 @router.get('/replay/observability')
@@ -385,8 +440,11 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
             return cached
 
         partial_reasons: list[str] = []
-        status = engine.status()
-        replay_status = engine.replay_status()
+        status = engine.status() or {}
+        replay_status = engine.replay_status() or {}
+        risk_status = status.get('risk') if isinstance(status, dict) else {}
+        if not isinstance(risk_status, dict):
+            risk_status = {}
         replay_payload = {
             'dataset_id': replay_status.get('dataset_id'),
             'pointer': replay_status.get('pointer_index'),
@@ -462,7 +520,7 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
                 gov_now = None
         governor = await _query_with_timeout(governor_service.evaluate_entry(db=db, now_ts=gov_now, dataset_id=replay_payload.get('dataset_id'), equity_start_day=equity_start, global_dd_pct=global_dd_pct, replay_mode=str(status.get('mode', '')).lower() == 'replay'), 0.15, governor)
 
-        risk_state_payload = dict(status['risk'])
+        risk_state_payload = dict(risk_status)
         risk_state_payload['status'] = 'ELIGIBLE' if governor.get('eligible', True) else 'BLOCKED'
         risk_state_payload['reason'] = ', '.join([str(b.get('reason')) for b in (governor.get('blockers') or [])[:3]]) if (governor.get('blockers') or []) else None
 
@@ -473,14 +531,14 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
             dataset_path = settings.replay_dataset_default
         payload = {
             'equity': equity_now,
-            'daily_dd_pct': status['risk']['daily_drawdown_pct'],
-            'global_dd_pct': status['risk']['global_drawdown_pct'],
-            'monthly_progress_pct': status['risk']['monthly_progress_pct'],
+            'daily_dd_pct': float(risk_status.get('daily_drawdown_pct') or 0.0),
+            'global_dd_pct': float(risk_status.get('global_drawdown_pct') or 0.0),
+            'monthly_progress_pct': float(risk_status.get('monthly_progress_pct') or 0.0),
             'open_positions': int(open_positions_count or 0),
             'risk_state': risk_state_payload,
             'risk_state_reason': risk_state_payload.get('reason'),
-            'mode': status['mode'].upper(),
-            'leverage': status['risk']['leverage'],
+            'mode': str(status.get('mode') or 'live').upper(),
+            'leverage': float(risk_status.get('leverage') or settings.leverage),
             'replay': replay_payload,
             'equity_start': equity_start,
             'equity_now': equity_now,
