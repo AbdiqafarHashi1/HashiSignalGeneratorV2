@@ -31,6 +31,13 @@ const PROFILE_OPTIONS = ['TREND_STABLE', 'GROWTH_HUNTER', 'PROP_HUNTER'] as cons
 const DEFAULT_REPLAY_DATASET =
   (process.env.NEXT_PUBLIC_REPLAY_DATASET_DEFAULT as string | undefined) ||
   'data/datasets/ETHUSDT_15m.csv';
+const normalizeSelectionValue = (dataset: any): string => String(dataset?.selection_value ?? dataset?.stored_path ?? dataset?.filename ?? dataset?.id ?? '').trim();
+const datasetLabel = (dataset: any): string => {
+  const label = dataset?.display_value ?? dataset?.filename;
+  if (label) return String(label);
+  const pathValue = String(dataset?.stored_path || '').replace(/\\/g, '/');
+  return pathValue.split('/').pop() || pathValue || 'dataset';
+};
 type EndpointKey = 'overview' | 'trades' | 'events' | 'positions' | 'observability';
 type FetchMeta = {
   lastOkAt: number | null;
@@ -260,7 +267,7 @@ export default function Page() {
   const [events, setEvents] = useState<any[]>([]);
   const [positions, setPositions] = useState<any[]>([]);
   const [datasets, setDatasets] = useState<any[]>([]);
-  const [selectedDatasetId, setSelectedDatasetId] = useState('');
+  const [selectedDatasetValue, setSelectedDatasetValue] = useState(String(DEFAULT_REPLAY_DATASET || ''));
   const [speed, setSpeed] = useState(1);
   const [eventFilter, setEventFilter] = useState<EventFilter>('ALL');
   const [selectedEventId, setSelectedEventId] = useState('');
@@ -440,16 +447,17 @@ export default function Page() {
     try {
       const ds = await fetchDatasets();
       setDatasets(ds || []);
-      setSelectedDatasetId((prev) => {
+      setSelectedDatasetValue((prev) => {
         if (prev) return prev;
         const preferred = String(DEFAULT_REPLAY_DATASET || '').replace(/\\/g, '/').toLowerCase();
         const preferredName = preferred.split('/').pop() || preferred;
         const match = (ds || []).find((row: any) => {
+          const selectionValue = normalizeSelectionValue(row).replace(/\\/g, '/').toLowerCase();
           const filename = String(row?.filename || '').toLowerCase();
           const storedPath = String(row?.stored_path || '').replace(/\\/g, '/').toLowerCase();
-          return filename === preferredName || storedPath.endsWith(preferred) || storedPath.endsWith(`/${preferredName}`);
+          return selectionValue === preferred || selectionValue.endsWith(`/${preferredName}`) || filename === preferredName || storedPath.endsWith(preferred) || storedPath.endsWith(`/${preferredName}`);
         });
-        return String(match?.id || ds?.[0]?.id || '');
+        return normalizeSelectionValue(match || ds?.[0]) || String(DEFAULT_REPLAY_DATASET || '');
       });
       setError('');
     } catch (e: any) {
@@ -470,7 +478,7 @@ export default function Page() {
     return () => clearTimeout(timer);
   }, [toast]);
 
-  const canStart = Boolean(selectedDatasetId || DEFAULT_REPLAY_DATASET);
+  const canStart = Boolean(selectedDatasetValue || DEFAULT_REPLAY_DATASET);
   const profile = String(overview?.active_profile || PROFILE_OPTIONS[0]).toUpperCase();
   const clock = overview?.replay?.candle_ts;
   const pointer = Number(overview?.replay?.pointer || 0);
@@ -655,9 +663,7 @@ export default function Page() {
   const runBacktest = useCallback(async () => {
     try {
       setBacktestResultData(null);
-      const payload = selectedDatasetId
-        ? { dataset_id: selectedDatasetId, profile }
-        : { dataset_path: DEFAULT_REPLAY_DATASET, profile };
+      const payload = { dataset_path: selectedDatasetValue || DEFAULT_REPLAY_DATASET, profile };
       const res = await backtestRun(payload);
       const runId = String(res?.run_id || '');
       if (!runId) throw new Error('No run_id returned by /backtest/run');
@@ -667,7 +673,7 @@ export default function Page() {
     } catch (e: any) {
       setError(errorText(e));
     }
-  }, [selectedDatasetId, profile]);
+  }, [selectedDatasetValue, profile]);
 
   useEffect(() => {
     if (dashboardMode !== 'BACKTEST' || !backtestRunId) return;
@@ -700,7 +706,7 @@ export default function Page() {
   const handleUpload = async (file: File) => {
     try {
       const res = await uploadDataset(file);
-      if (res?.dataset_id) setSelectedDatasetId(String(res.dataset_id));
+      if (res?.stored_path || res?.filename) setSelectedDatasetValue(String(res.stored_path || res.filename));
       await loadDatasets();
       await loadOverview();
       setToast({ type: 'ok', message: 'Dataset uploaded' });
@@ -734,9 +740,9 @@ export default function Page() {
           <div className='pt-3 border-t border-zinc-800/70 space-y-3'>
             <div className='flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between'>
               <div className='flex flex-wrap items-center gap-3'>
-                <select value={selectedDatasetId} onChange={(e) => setSelectedDatasetId(e.target.value)} className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 min-w-[230px] text-sm'>
-                  <option value=''>Default ({DEFAULT_REPLAY_DATASET})</option>
-                  {datasets.map((d) => <option key={d.id} value={d.id}>{d.filename}</option>)}
+                <select value={selectedDatasetValue} onChange={(e) => setSelectedDatasetValue(e.target.value)} className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 min-w-[230px] text-sm'>
+                  <option value={String(DEFAULT_REPLAY_DATASET || '')}>Default ({DEFAULT_REPLAY_DATASET})</option>
+                  {datasets.map((d) => <option key={String(d.id || d.stored_path || d.filename)} value={normalizeSelectionValue(d)}>{datasetLabel(d)}</option>)}
                 </select>
                 <input ref={fileRef} type='file' accept='.csv' className='hidden' onChange={(e) => e.target.files?.[0] && void handleUpload(e.target.files[0])} />
                 <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => fileRef.current?.click()}>Upload</button>
@@ -746,7 +752,7 @@ export default function Page() {
               </div>
 
               <div className='flex flex-wrap items-center gap-3'>
-                <button className='h-9 rounded border border-cyan-700 bg-cyan-950/30 px-3 text-sm text-cyan-200 disabled:opacity-50 disabled:cursor-not-allowed' disabled={!canStart} title={canStart ? '' : 'Select or upload a dataset first'} onClick={() => performControl(() => replayStart(selectedDatasetId ? { dataset_id: selectedDatasetId, speed: Math.max(1, Math.round(speed)) } : { csv_path: DEFAULT_REPLAY_DATASET, speed: Math.max(1, Math.round(speed)) }))}>Start</button>
+                <button className='h-9 rounded border border-cyan-700 bg-cyan-950/30 px-3 text-sm text-cyan-200 disabled:opacity-50 disabled:cursor-not-allowed' disabled={!canStart} title={canStart ? '' : 'Select or upload a dataset first'} onClick={() => performControl(() => replayStart({ csv_path: selectedDatasetValue || DEFAULT_REPLAY_DATASET, speed: Math.max(1, Math.round(speed)) }))}>Start</button>
                 <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => performControl(() => replayPause())}>Pause</button>
                 <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => performControl(() => replayResume())}>Resume</button>
                 <button className='h-9 rounded border border-zinc-700 bg-zinc-900 px-3 text-sm' onClick={() => performControl(() => replayStep())}>Step</button>
