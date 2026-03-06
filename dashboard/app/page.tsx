@@ -121,6 +121,8 @@ function usePollingLoop(task: () => Promise<void> | void, getDelayMs: () => numb
   }, []);
 }
 
+const OVERVIEW_POLLER_LABEL = '[dashboard][overview-poller-singleton-v2]';
+
 function Led({ on }: { on: boolean }) {
   return <span className={`inline-block h-2.5 w-2.5 rounded-full ${on ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-500'}`} />;
 }
@@ -482,7 +484,34 @@ export default function Page() {
     void loadDatasets();
   }, [loadDatasets]);
 
-  usePollingLoop(() => loadOverview(), () => 3000);
+  useEffect(() => {
+    console.debug(`${OVERVIEW_POLLER_LABEL} kept trigger: mount/start`);
+    let stop = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (stop) return;
+      console.debug(`${OVERVIEW_POLLER_LABEL} trigger: scheduled tick`);
+      await loadOverview();
+      if (stop) return;
+      timer = setTimeout(() => {
+        void tick();
+      }, 3000);
+    };
+
+    void tick();
+
+    return () => {
+      stop = true;
+      if (timer) clearTimeout(timer);
+      console.debug(`${OVERVIEW_POLLER_LABEL} kept trigger: unmount/stop`);
+    };
+  }, [loadOverview]);
+
+  useEffect(() => {
+    console.debug('[dashboard] removed trigger source: mode switch no longer triggers /overview directly');
+  }, [dashboardMode]);
+
   usePollingLoop(() => (dashboardMode === 'BACKTEST' ? Promise.resolve() : loadStreams()), () => (dashboardMode === 'BACKTEST' ? 7000 : (isRunningRef.current ? 1200 : 3500)));
 
   useEffect(() => {
@@ -663,14 +692,14 @@ export default function Page() {
     controlInFlightRef.current = true;
     try {
       await action();
-      await loadOverview();
+      console.debug('[dashboard] removed trigger source: control action success no longer forces /overview; single poller will refresh');
       await loadStreams();
     } catch (e: any) {
       setError(errorText(e));
     } finally {
       controlInFlightRef.current = false;
     }
-  }, [loadOverview, loadStreams]);
+  }, [loadStreams]);
 
 
   const runBacktest = useCallback(async () => {
@@ -721,7 +750,7 @@ export default function Page() {
       const res = await uploadDataset(file);
       if (res?.stored_path || res?.filename) setSelectedDatasetValue(String(res.stored_path || res.filename));
       await loadDatasets();
-      await loadOverview();
+      console.debug('[dashboard] removed trigger source: dataset upload no longer forces /overview; single poller will refresh');
       setToast({ type: 'ok', message: 'Dataset uploaded' });
     } catch (e: any) {
       const msg = errorText(e);
@@ -738,7 +767,7 @@ export default function Page() {
             <ModeBadge mode={String(overview?.mode || 'LIVE').toUpperCase()} />
             <span className='inline-flex h-8 items-center gap-2 rounded border border-zinc-700 bg-zinc-900 px-2.5'><Led on={isRunning} />{isRunning ? 'running' : 'stopped'}</span>
             <span className='inline-flex h-8 items-center rounded border border-cyan-700 bg-cyan-950/20 px-2.5 font-semibold'>Profile {profile}</span>
-            <select value={profile} disabled={profileLoading} onChange={async (e) => { try { setProfileLoading(true); await controlSetProfile(e.target.value as 'TREND_STABLE' | 'GROWTH_HUNTER' | 'PROP_HUNTER'); await loadOverview(); } catch (err: any) { setError(errorText(err)); } finally { setProfileLoading(false); } }} className='h-8 rounded border border-zinc-700 bg-zinc-900 px-2.5'>
+            <select value={profile} disabled={profileLoading} onChange={async (e) => { try { setProfileLoading(true); await controlSetProfile(e.target.value as 'TREND_STABLE' | 'GROWTH_HUNTER' | 'PROP_HUNTER'); console.debug('[dashboard] removed trigger source: profile switch no longer forces /overview; single poller will refresh'); } catch (err: any) { setError(errorText(err)); } finally { setProfileLoading(false); } }} className='h-8 rounded border border-zinc-700 bg-zinc-900 px-2.5'>
               {PROFILE_OPTIONS.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
             <span className='inline-flex h-8 items-center rounded border border-zinc-700 bg-zinc-900 px-2.5'>Clock {text(clock)}</span>
@@ -972,7 +1001,7 @@ export default function Page() {
                 <div>uPnL {displayPosition?.unrealized_pnl !== undefined ? fmtNum(displayPosition?.unrealized_pnl, 2) : 'uPnL not supported yet'}</div>
               </div>
               <div className='space-y-2 flex flex-col justify-end'>
-                <button className='rounded border border-rose-700 bg-rose-900/35 px-3 py-2 text-rose-300' onClick={async () => { if (!displayOpenTrade?.id) return setError('open trade id missing'); if (!window.confirm('Close position now?')) return; try { await executeCloseNow({ mode: String(overview?.mode || 'REPLAY'), tradeId: String(displayOpenTrade.id), symbol: String(displayOpenTrade?.symbol || displayPosition?.symbol || '') }); await loadStreams(); await loadOverview(); } catch (e: any) { setError(errorText(e)); } }}>Close Now</button>
+                <button className='rounded border border-rose-700 bg-rose-900/35 px-3 py-2 text-rose-300' onClick={async () => { if (!displayOpenTrade?.id) return setError('open trade id missing'); if (!window.confirm('Close position now?')) return; try { await executeCloseNow({ mode: String(overview?.mode || 'REPLAY'), tradeId: String(displayOpenTrade.id), symbol: String(displayOpenTrade?.symbol || displayPosition?.symbol || '') }); await loadStreams(); console.debug('[dashboard] removed trigger source: close-now no longer forces /overview; single poller will refresh'); } catch (e: any) { setError(errorText(e)); } }}>Close Now</button>
                 <button
                   disabled
                   title='Coming later'
