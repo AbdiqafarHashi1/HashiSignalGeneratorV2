@@ -10,6 +10,7 @@ from app.api.routes import router
 from app.config import settings
 from app.db.base import Base
 from app.db.session import engine
+from app.services.dataset_resolver import DatasetResolver
 from app.models import entities  # noqa: F401
 
 
@@ -70,7 +71,18 @@ async def _upgrade_trade_columns(conn: AsyncConnection) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    dataset_resolver = DatasetResolver()
     (Path(settings.data_dir) / 'uploads').mkdir(parents=True, exist_ok=True)
+    raw_default = settings.replay_dataset_default
+    resolved_default = None
+    exists = False
+    try:
+        resolved_default = dataset_resolver.resolve_default().resolved_path
+        exists = Path(resolved_default).exists()
+    except Exception:
+        resolved_default = None
+        exists = False
+    print(f"[startup] REPLAY_DATASET_DEFAULT raw={raw_default!r} resolved={resolved_default!r} exists={exists}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _upgrade_bigint_columns(conn)

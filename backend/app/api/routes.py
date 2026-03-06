@@ -15,6 +15,7 @@ from app.dependencies import get_engine_service, get_instant_backtest_service
 from app.models.entities import DecisionEvent, Execution, Position, ReplayDataset, Trade
 from app.schemas.common import BacktestRunRequest, ReplayStartRequest
 from app.services.accounting import PortfolioAccounting
+from app.services.dataset_resolver import DatasetResolutionError, DatasetResolver
 from app.services.datasets import persist_upload
 from app.services.engine import EngineService
 from app.services.instant_backtest import InstantBacktestService
@@ -22,6 +23,15 @@ from app.services.governor import GovernorService
 from app.telegram.service import TelegramService
 
 router = APIRouter()
+dataset_resolver = DatasetResolver()
+
+
+def _dataset_missing_detail(exc: DatasetResolutionError) -> dict:
+    return {
+        'error': 'dataset_not_found',
+        'raw_value': exc.raw_value,
+        'attempted_paths': exc.attempted_paths,
+    }
 
 
 @router.post('/engine/start')
@@ -62,12 +72,16 @@ async def replay_start(
     if dataset:
         dataset_id = str(dataset.id)
         csv_path = dataset.stored_path
-    if not csv_path:
-        csv_path = await engine.resolve_replay_dataset_path(dataset_id=dataset_id)
-    if not csv_path:
-        raise HTTPException(status_code=400, detail='Provide dataset_id, filename, or csv_path')
-    if not Path(csv_path).exists():
-        raise HTTPException(status_code=400, detail=f'csv_path not found: {csv_path}')
+    raw_dataset_value = csv_path
+    if not raw_dataset_value:
+        with __import__('contextlib').suppress(Exception):
+            raw_dataset_value = await engine.resolve_replay_dataset_path(dataset_id=dataset_id)
+    try:
+        resolution = dataset_resolver.resolve(raw_dataset_value, fallback_default=settings.replay_dataset_default)
+    except DatasetResolutionError as exc:
+        raise HTTPException(status_code=400, detail=_dataset_missing_detail(exc)) from exc
+    csv_path = resolution.resolved_path
+    print(f"[replay.start] dataset raw={raw_dataset_value!r} resolved={csv_path!r}")
     try:
         await engine.start_replay(
             csv_path=csv_path,
@@ -156,13 +170,22 @@ async def backtest_run(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     dataset_path = body.dataset_path
+    dataset = None
     if body.dataset_id:
         dataset = await db.get(ReplayDataset, body.dataset_id)
         if not dataset:
             raise HTTPException(status_code=400, detail='dataset_id not found')
         dataset_path = dataset.stored_path
-    if not dataset_path:
-        dataset_path = await engine.resolve_replay_dataset_path(dataset_id=None)
+    raw_dataset_value = dataset_path
+    if not raw_dataset_value:
+        with __import__('contextlib').suppress(Exception):
+            raw_dataset_value = await engine.resolve_replay_dataset_path(dataset_id=str(body.dataset_id) if body.dataset_id else None)
+    try:
+        resolution = dataset_resolver.resolve(raw_dataset_value, fallback_default=settings.replay_dataset_default)
+    except DatasetResolutionError as exc:
+        raise HTTPException(status_code=400, detail=_dataset_missing_detail(exc)) from exc
+    dataset_path = resolution.resolved_path
+    print(f"[backtest.run] dataset raw={raw_dataset_value!r} resolved={dataset_path!r}")
     try:
         run_id = await backtest.run(
             {
@@ -243,8 +266,12 @@ async def replay_upload(file: UploadFile = File(...), db: AsyncSession = Depends
 
 @router.get('/replay/datasets')
 async def replay_datasets(db: AsyncSession = Depends(get_db)) -> list[dict]:
-    rows = (await db.execute(select(ReplayDataset).order_by(desc(ReplayDataset.created_at)).limit(500))).scalars()
-    return [
+    rows = []
+    try:
+        rows = (await __import__('asyncio').wait_for(db.execute(select(ReplayDataset).order_by(desc(ReplayDataset.created_at)).limit(500)), timeout=1.0)).scalars().all()
+    except Exception:
+        rows = []
+    payload = [
         {
             'id': str(row.id),
             'filename': row.filename,
@@ -255,9 +282,36 @@ async def replay_datasets(db: AsyncSession = Depends(get_db)) -> list[dict]:
             'start_ts': row.start_ts,
             'end_ts': row.end_ts,
             'created_at': row.created_at,
+            'display_value': row.filename,
+            'selection_value': row.stored_path or row.filename,
         }
         for row in rows
     ]
+    try:
+        default_ds = dataset_resolver.resolve_default()
+        already_present = any(str(item.get('stored_path')) == default_ds.resolved_path for item in payload)
+        if not already_present:
+            payload.insert(
+                0,
+                {
+                    'id': f'env-default:{Path(default_ds.resolved_path).name}',
+                    'filename': Path(default_ds.resolved_path).name,
+                    'stored_path': default_ds.resolved_path,
+                    'symbol': settings.default_symbol,
+                    'timeframe': None,
+                    'rows_count': None,
+                    'start_ts': None,
+                    'end_ts': None,
+                    'created_at': None,
+                    'is_default': True,
+                    'source': 'filesystem',
+                    'display_value': default_ds.display_value,
+                    'selection_value': default_ds.raw_value or settings.replay_dataset_default,
+                },
+            )
+    except Exception:
+        pass
+    return payload
 
 
 @router.get('/replay/datasets/{dataset_id}')
@@ -298,6 +352,8 @@ async def list_positions(db: AsyncSession = Depends(get_db)) -> list[dict]:
             'is_open': row.is_open,
             'status': 'OPEN' if row.is_open else 'CLOSED',
             'created_at': row.created_at,
+            'display_value': row.filename,
+            'selection_value': row.stored_path or row.filename,
         }
         for row in rows
     ]

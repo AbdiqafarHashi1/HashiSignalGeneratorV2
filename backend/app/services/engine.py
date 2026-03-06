@@ -20,6 +20,7 @@ from app.profiles import get_profile_manager
 from app.replay.replay_engine import ReplayEngine
 from app.risk.manager import RiskManager
 from app.services.accounting import PortfolioAccounting
+from app.services.dataset_resolver import DatasetResolver
 from app.services.governor import GovernorService
 from app.services.safety import KillSwitchMode, SafetyService
 from app.strategies.base import MomentumStrategy
@@ -35,6 +36,7 @@ class EngineService:
             session_factory = SessionLocal
         self.redis = redis_client
         self.session_factory = session_factory
+        self.dataset_resolver = DatasetResolver()
         self.running = False
         self.mode = settings.engine_mode
         self.tick = 0
@@ -224,7 +226,10 @@ class EngineService:
             cached = await self.redis.get('replay:dataset_path')
         if cached:
             return str(cached)
-        return str(settings.replay_dataset_default)
+        try:
+            return self.dataset_resolver.resolve_default().resolved_path
+        except Exception:
+            return str(settings.replay_dataset_default)
 
     async def pause_replay(self) -> dict:
         if self.replay:
