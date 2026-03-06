@@ -291,6 +291,7 @@ export default function Page() {
   });
   const fileRef = useRef<HTMLInputElement | null>(null);
   const overviewReqSeq = useRef(0);
+  const activeOverviewReqIdRef = useRef(0);
   const streamsReqSeq = useRef(0);
   const isRunningRef = useRef(false);
   const tradesRef = useRef<any[]>([]);
@@ -298,6 +299,7 @@ export default function Page() {
   const positionsRef = useRef<any[]>([]);
   const [lastStablePosition, setLastStablePosition] = useState<any | null>(null);
   const overviewInFlightRef = useRef(false);
+  const overviewAbortRef = useRef<AbortController | null>(null);
   const controlInFlightRef = useRef(false);
   const [overviewBackoffMs, setOverviewBackoffMs] = useState(500);
   const [dashboardMode, setDashboardMode] = useState<'REPLAY' | 'BACKTEST'>('REPLAY');
@@ -338,26 +340,70 @@ export default function Page() {
   }, []);
 
   const loadOverview = useCallback(async () => {
-    if (overviewInFlightRef.current || controlInFlightRef.current) return;
-    overviewInFlightRef.current = true;
+    if (controlInFlightRef.current) return;
+
     const reqId = ++overviewReqSeq.current;
+    activeOverviewReqIdRef.current = reqId;
     const startedAt = Date.now();
+
+    if (overviewAbortRef.current) {
+      overviewAbortRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    overviewAbortRef.current = controller;
+    overviewInFlightRef.current = true;
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.debug(`[dashboard] overview fetch start req=${reqId}`);
+    }
+
     try {
-      const res = await fetchOverview(5000);
-      if (reqId !== overviewReqSeq.current) return;
+      const res = await fetchOverview(5000, controller.signal);
+      if (reqId !== activeOverviewReqIdRef.current) return;
+
+      if (process.env.NODE_ENV !== 'production') {
+        console.debug(`[dashboard] overview fetch success req=${reqId}`);
+      }
+
       setOverview(res || {});
       markFetchMeta('overview', { lastOkAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastCount: null, lastErr: null });
-      setError('');
+      setError((prev) => {
+        if (prev && process.env.NODE_ENV !== 'production') {
+          console.debug(`[dashboard] overview banner cleared req=${reqId}`);
+        }
+        return '';
+      });
       setLastRefreshAt(Date.now());
       setOverviewBackoffMs(500);
       setPollTick((t) => t + 1);
     } catch (e: any) {
-      markFetchMeta('overview', { lastErrAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastErr: errorText(e) });
-      setError((prev) => prev || errorText(e));
+      if (reqId !== activeOverviewReqIdRef.current) return;
+
+      const message = errorText(e);
+      markFetchMeta('overview', { lastErrAt: Date.now(), lastDurationMs: Date.now() - startedAt, lastErr: message });
+
+      if (message.includes('aborted')) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.debug(`[dashboard] overview fetch abort req=${reqId}`);
+        }
+        return;
+      }
+
+      if (process.env.NODE_ENV !== 'production') {
+        if (message.includes('timeout')) {
+          console.debug(`[dashboard] overview fetch timeout req=${reqId}`);
+        }
+        console.debug(`[dashboard] overview banner set req=${reqId}: ${message}`);
+      }
+
+      setError(message);
       setOverviewBackoffMs((prev) => Math.min(5000, Math.max(500, prev * 2)));
       setPollTick((t) => t + 1);
     } finally {
-      overviewInFlightRef.current = false;
+      if (reqId === activeOverviewReqIdRef.current) {
+        overviewInFlightRef.current = false;
+      }
     }
   }, [markFetchMeta]);
 
@@ -463,6 +509,12 @@ export default function Page() {
     } catch (e: any) {
       setError(errorText(e));
     }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (overviewAbortRef.current) overviewAbortRef.current.abort();
+    };
   }, []);
 
   useEffect(() => {

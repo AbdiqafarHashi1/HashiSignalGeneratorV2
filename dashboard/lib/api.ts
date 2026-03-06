@@ -24,14 +24,30 @@ const requestJson = async (
   endpoint: string,
   init?: RequestInit,
   params?: Record<string, any>,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; signal?: AbortSignal },
 ) => {
   let response: Response;
   const controller = new AbortController();
+  const upstreamSignal = opts?.signal;
+  let abortedByTimeout = false;
+
+  const abortFromUpstream = () => {
+    controller.abort(upstreamSignal?.reason);
+  };
+
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) {
+      abortFromUpstream();
+    } else {
+      upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
+    }
+  }
+
   const timeoutMs = opts?.timeoutMs;
   const timer =
     timeoutMs && timeoutMs > 0
       ? setTimeout(() => {
+          abortedByTimeout = true;
           controller.abort();
         }, timeoutMs)
       : null;
@@ -44,15 +60,21 @@ const requestJson = async (
       ...init,
       cache: "no-store",
       headers,
-      signal: init?.signal ?? controller.signal,
+      signal: controller.signal,
     });
   } catch (error: any) {
     if (error?.name === "AbortError") {
-      throw new Error(`${endpoint}: timeout after ${timeoutMs ?? "unknown"}ms`);
+      if (abortedByTimeout) {
+        throw new Error(`${endpoint}: timeout after ${timeoutMs ?? "unknown"}ms`);
+      }
+      throw new Error(`${endpoint}: aborted`);
     }
     throw new Error(`${endpoint}: ${error?.message ?? String(error)}`);
   } finally {
     if (timer) clearTimeout(timer);
+    if (upstreamSignal) {
+      upstreamSignal.removeEventListener("abort", abortFromUpstream);
+    }
   }
 
   if (response.ok) {
@@ -72,7 +94,7 @@ const requestJson = async (
   throw new Error(`${endpoint}: ${detail}`);
 };
 
-const get = async (endpoint: string, params?: Record<string, any>, opts?: { timeoutMs?: number }) =>
+const get = async (endpoint: string, params?: Record<string, any>, opts?: { timeoutMs?: number; signal?: AbortSignal }) =>
   requestJson(endpoint, undefined, params, opts);
 
 const post = async (endpoint: string, body?: any, headers?: Record<string, string>, opts?: { timeoutMs?: number }) => {
@@ -172,7 +194,8 @@ export const normalizeDatasets = (res: any): any[] => {
 };
 
 export const apiBaseUrl = baseURL;
-export const fetchOverview = async (timeoutMs?: number) => get("/overview", { _ts: Date.now() }, { timeoutMs });
+export const fetchOverview = async (timeoutMs?: number, signal?: AbortSignal) =>
+  get("/overview", { _ts: Date.now() }, { timeoutMs, signal });
 export const fetchTrades = async (limit = 500, offset = 0, timeoutMs?: number) => {
   const raw = await get("/trades", { limit, offset, _ts: Date.now() }, { timeoutMs });
   return normalizeTrades(raw);
