@@ -1,6 +1,9 @@
 from collections import Counter
 from datetime import datetime, timezone
+import asyncio
+import logging
 from pathlib import Path
+import time
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -24,6 +27,7 @@ from app.telegram.service import TelegramService
 
 router = APIRouter()
 dataset_resolver = DatasetResolver()
+logger = logging.getLogger(__name__)
 
 
 def _dataset_missing_detail(exc: DatasetResolutionError) -> dict:
@@ -473,31 +477,114 @@ async def overview(engine: EngineService = Depends(get_engine_service), db: Asyn
 
 
 _OVERVIEW_CACHE: dict = {'ts': 0.0, 'payload': None}
-_OVERVIEW_LOCK = __import__('asyncio').Lock()
+_OVERVIEW_LOCK = asyncio.Lock()
+_OVERVIEW_CACHE_TTL_SECONDS = 0.4
+_OVERVIEW_SECTION_TIMEOUT_SECONDS = 0.2
+_OVERVIEW_TOTAL_BUDGET_SECONDS = 1.5
 
 
 async def _query_with_timeout(coro, timeout: float, default):
     try:
-        return await __import__('asyncio').wait_for(coro, timeout=timeout)
+        return await asyncio.wait_for(coro, timeout=timeout)
     except Exception:
         return default
 
 
-async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict:
-    import time
-    now = time.monotonic()
+def _build_overview_payload_from_defaults(status: dict, replay_status: dict, partial_reasons: list[str]) -> dict:
+    replay_payload = {
+        'dataset_id': replay_status.get('dataset_id'),
+        'pointer': replay_status.get('pointer_index'),
+        'candle_ts': replay_status.get('current_ts'),
+        'is_running': bool(replay_status.get('running')),
+        'speed': replay_status.get('speed'),
+    } if str(status.get('mode', '')).lower() == 'replay' else {
+        'dataset_id': None,
+        'pointer': None,
+        'candle_ts': None,
+        'is_running': False,
+        'speed': None,
+    }
+    risk_status = status.get('risk') if isinstance(status, dict) else {}
+    if not isinstance(risk_status, dict):
+        risk_status = {}
+    equity_start = float(settings.equity_start)
+    equity_now = float(settings.equity_start)
+    payload = {
+        'equity': equity_now,
+        'daily_dd_pct': float(risk_status.get('daily_drawdown_pct') or 0.0),
+        'global_dd_pct': float(risk_status.get('global_drawdown_pct') or 0.0),
+        'monthly_progress_pct': float(risk_status.get('monthly_progress_pct') or 0.0),
+        'open_positions': 0,
+        'risk_state': {
+            **risk_status,
+            'status': 'ELIGIBLE',
+            'reason': None,
+        },
+        'risk_state_reason': None,
+        'mode': str(status.get('mode') or 'live').upper(),
+        'leverage': float(risk_status.get('leverage') or settings.leverage),
+        'replay': replay_payload,
+        'equity_start': equity_start,
+        'equity_now': equity_now,
+        'realized_pnl_net': 0.0,
+        'unrealized_pnl': 0.0,
+        'fees_total': 0.0,
+        'reconcile_delta': 0.0,
+        'reconcile_ok': True,
+        'accounting': {},
+        'dd': {'hwm': equity_now, 'global_dd_pct': 0.0, 'daily_dd_pct': 0.0, 'dd_daily_supported': False},
+        'goal': {'target_pct': float(settings.monthly_target_pct), 'progress_pct': 0.0, 'progress_ratio': 0.0},
+        'governor': {'eligible': True, 'blockers': [], 'stats': {}, 'config': {}},
+        'latest_decision': {'ts': None, 'symbol': None, 'decision': None, 'regime': None, 'score': None, 'message': None, 'blockers_top': None, 'regime_gate_ok': None, 'top_regime_gate_reasons': None, 'regime_gate_metrics': None, 'active_mode': None, 'mode_reasons': None},
+        'active_profile': status.get('active_profile'),
+        'profile_stats': {'active_profile': status.get('active_profile'), 'trades_today': 0, 'entries_by_module': {}, 'last_entry_ts': None},
+        'safety': status.get('safety') or {},
+        'pre_trade_decision': status.get('pre_trade_decision') or {'allowed': True, 'reasonCode': None, 'reasonDetail': None, 'metrics': {}},
+        'day': status.get('day') or {'day_key': None, 'rollover_in_effect': False, 'daily_consecutive_losses': 0, 'daily_realized_pnl': 0.0, 'daily_fees': 0.0, 'daily_trade_count': 0},
+        'dataset_path': settings.replay_dataset_default,
+    }
+    if partial_reasons:
+        payload['partial'] = True
+        payload['partial_reason'] = ','.join(partial_reasons)
+    return payload
+
+
+def _cached_or_safe_overview(engine: EngineService, reason: str) -> dict:
     cached = _OVERVIEW_CACHE.get('payload')
-    if cached is not None and (now - float(_OVERVIEW_CACHE.get('ts') or 0.0)) < 0.4:
+    if cached is not None:
+        payload = dict(cached)
+        payload['partial'] = True
+        payload['partial_reason'] = ','.join(filter(None, [payload.get('partial_reason'), reason]))
+        return payload
+    status = engine.status() or {}
+    replay_status = engine.replay_status() or {}
+    return _build_overview_payload_from_defaults(status=status, replay_status=replay_status, partial_reasons=[reason])
+
+
+async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict:
+    now = time.monotonic()
+    logger.info('overview route entered')
+    cached = _OVERVIEW_CACHE.get('payload')
+    if cached is not None and (now - float(_OVERVIEW_CACHE.get('ts') or 0.0)) < _OVERVIEW_CACHE_TTL_SECONDS:
         return cached
-    async with _OVERVIEW_LOCK:
+    budget_start = time.monotonic()
+    try:
+        await asyncio.wait_for(_OVERVIEW_LOCK.acquire(), timeout=0.2)
+    except TimeoutError:
+        logger.warning('overview lock wait timed out')
+        return _cached_or_safe_overview(engine=engine, reason='overview_lock_timeout')
+
+    try:
         now = time.monotonic()
         cached = _OVERVIEW_CACHE.get('payload')
-        if cached is not None and (now - float(_OVERVIEW_CACHE.get('ts') or 0.0)) < 0.4:
+        if cached is not None and (now - float(_OVERVIEW_CACHE.get('ts') or 0.0)) < _OVERVIEW_CACHE_TTL_SECONDS:
             return cached
 
         partial_reasons: list[str] = []
+        section_start = time.monotonic()
         status = engine.status() or {}
         replay_status = engine.replay_status() or {}
+        logger.info('overview load engine/replay state duration_ms=%.2f', (time.monotonic() - section_start) * 1000)
         risk_status = status.get('risk') if isinstance(status, dict) else {}
         if not isinstance(risk_status, dict):
             risk_status = {}
@@ -511,7 +598,8 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
             'dataset_id': None, 'pointer': None, 'candle_ts': None, 'is_running': False, 'speed': None,
         }
 
-        accounting = await _query_with_timeout(PortfolioAccounting().snapshot(db), 0.12, None)
+        section_start = time.monotonic()
+        accounting = await _query_with_timeout(PortfolioAccounting().snapshot(db), _OVERVIEW_SECTION_TIMEOUT_SECONDS, None)
         if accounting is None:
             partial_reasons.append('accounting_timeout')
             accounting = {
@@ -525,15 +613,16 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
                 'accounting': {},
             }
 
-        open_positions_count = await _query_with_timeout(db.scalar(select(__import__('sqlalchemy').func.count()).select_from(Position).where(Position.is_open.is_(True))), 0.1, 0)
+        open_positions_count = await _query_with_timeout(db.scalar(select(__import__('sqlalchemy').func.count()).select_from(Position).where(Position.is_open.is_(True))), _OVERVIEW_SECTION_TIMEOUT_SECONDS, 0)
         if open_positions_count is None:
             open_positions_count = 0
             partial_reasons.append('positions_timeout')
 
-        latest = await _query_with_timeout((db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1))).then(lambda x: x.scalar_one_or_none()) if False else db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1)), 0.1, None)
+        latest = await _query_with_timeout((db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1))).then(lambda x: x.scalar_one_or_none()) if False else db.execute(select(DecisionEvent).order_by(desc(DecisionEvent.created_at)).limit(1)), _OVERVIEW_SECTION_TIMEOUT_SECONDS, None)
         latest_row = latest.scalar_one_or_none() if latest is not None else None
         if latest is None:
             partial_reasons.append('decision_timeout')
+        logger.info('overview load position/trade summary duration_ms=%.2f', (time.monotonic() - section_start) * 1000)
 
         latest_decision = {'ts': None, 'symbol': None, 'decision': None, 'regime': None, 'score': None, 'message': None, 'blockers_top': None, 'regime_gate_ok': None, 'top_regime_gate_reasons': None, 'regime_gate_metrics': None, 'active_mode': None, 'mode_reasons': None}
         if latest_row:
@@ -556,9 +645,10 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
         equity_now = float(accounting['equity_now'])
         equity_start = float(accounting['equity_start'])
         governor_service = GovernorService(redis_client=engine.redis)
+        section_start = time.monotonic()
         hwm = await _query_with_timeout(
             governor_service.compute_hwm(redis_client=engine.redis, dataset_id=replay_payload.get('dataset_id'), equity_start=equity_start, equity_now=equity_now),
-            0.1,
+            _OVERVIEW_SECTION_TIMEOUT_SECONDS,
             max(equity_start, equity_now),
         )
         if hwm is None:
@@ -574,17 +664,18 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
                 gov_now = datetime.fromisoformat(str(replay_payload.get('candle_ts')).replace('Z', '+00:00'))
             except Exception:
                 gov_now = None
-        governor = await _query_with_timeout(governor_service.evaluate_entry(db=db, now_ts=gov_now, dataset_id=replay_payload.get('dataset_id'), equity_start_day=equity_start, global_dd_pct=global_dd_pct, replay_mode=str(status.get('mode', '')).lower() == 'replay'), 0.15, governor)
+        governor = await _query_with_timeout(governor_service.evaluate_entry(db=db, now_ts=gov_now, dataset_id=replay_payload.get('dataset_id'), equity_start_day=equity_start, global_dd_pct=global_dd_pct, replay_mode=str(status.get('mode', '')).lower() == 'replay'), _OVERVIEW_SECTION_TIMEOUT_SECONDS, governor)
+        logger.info('overview load risk/governor state duration_ms=%.2f', (time.monotonic() - section_start) * 1000)
 
         risk_state_payload = dict(risk_status)
         risk_state_payload['status'] = 'ELIGIBLE' if governor.get('eligible', True) else 'BLOCKED'
         risk_state_payload['reason'] = ', '.join([str(b.get('reason')) for b in (governor.get('blockers') or [])[:3]]) if (governor.get('blockers') or []) else None
 
-        dataset_path = settings.replay_dataset_default
-        try:
-            dataset_path = await engine.redis.get('replay:dataset_path') or settings.replay_dataset_default
-        except Exception:
+        section_start = time.monotonic()
+        dataset_path = await _query_with_timeout(engine.redis.get('replay:dataset_path'), _OVERVIEW_SECTION_TIMEOUT_SECONDS, settings.replay_dataset_default)
+        if not dataset_path:
             dataset_path = settings.replay_dataset_default
+            partial_reasons.append('dataset_path_timeout')
         payload = {
             'equity': equity_now,
             'daily_dd_pct': float(risk_status.get('daily_drawdown_pct') or 0.0),
@@ -615,12 +706,20 @@ async def build_overview_cached(engine: EngineService, db: AsyncSession) -> dict
             'day': status.get('day') or {'day_key': None, 'rollover_in_effect': False, 'daily_consecutive_losses': 0, 'daily_realized_pnl': 0.0, 'daily_fees': 0.0, 'daily_trade_count': 0},
             'dataset_path': dataset_path,
         }
+        logger.info('overview load equity/curve duration_ms=%.2f', (time.monotonic() - section_start) * 1000)
+        if (time.monotonic() - budget_start) > _OVERVIEW_TOTAL_BUDGET_SECONDS:
+            partial_reasons.append('overview_budget_exceeded')
+            return _cached_or_safe_overview(engine=engine, reason='overview_budget_exceeded')
         if partial_reasons:
             payload['partial'] = True
             payload['partial_reason'] = ','.join(partial_reasons)
+        logger.info('overview finalize response duration_ms=%.2f total_ms=%.2f', (time.monotonic() - section_start) * 1000, (time.monotonic() - budget_start) * 1000)
         _OVERVIEW_CACHE['payload'] = payload
         _OVERVIEW_CACHE['ts'] = time.monotonic()
         return payload
+    finally:
+        if _OVERVIEW_LOCK.locked():
+            _OVERVIEW_LOCK.release()
 
 
 @router.get('/events')
